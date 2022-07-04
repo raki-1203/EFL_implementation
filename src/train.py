@@ -3,8 +3,10 @@ import json
 import logging
 import math
 import os
+import sys
 import random
 
+import wandb
 import torch
 from datasets import load_dataset, load_metric
 from torch.utils.data import DataLoader
@@ -16,7 +18,9 @@ from accelerate.utils import set_seed
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
+    RobertaForSequenceClassification,
     AutoTokenizer,
+    BertTokenizer,
     DataCollatorWithPadding,
     SchedulerType,
     default_data_collator,
@@ -24,17 +28,31 @@ from transformers import (
 )
 
 
-logger = get_logger(__name__)
 project_dir = os.path.dirname(os.path.dirname(__file__))
+data_dir = os.path.join(project_dir, 'data')
+
+sys.path.append(project_dir)
+
+from src.utils import save_pickle, load_pickle
+
+
+# wandb description silent
+os.environ['WANDB_SILENT'] = "true"
+
+# gpu setting
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # Arrange GPU devices starting from 0
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Set the GPU 0 to use
+
+logger = get_logger(__name__)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Finetune a transformers model on a text classification task')
     parser.add_argument(
-        '--train_file', type=str, default=None, help='A csv or a xlsx file containing the training data.'
+        '--train_file', type=str, default=None, help='A csv or a json file containing the training data.'
     )
     parser.add_argument(
-        '--validation_file', type=str, default=None, help='A csv or a xlsx file containing the validation data.'
+        '--validation_file', type=str, default=None, help='A csv or a json file containing the validation data.'
     )
     parser.add_argument(
         '--max_length',
@@ -69,13 +87,13 @@ def parse_args():
     parser.add_argument(
         '--per_device_train_batch_size',
         type=int,
-        default=8,
+        default=25,
         help='Batch size (per device) for the training dataloader.',
     )
     parser.add_argument(
         '--per_device_eval_batch_size',
         type=int,
-        default=8,
+        default=128,
         help='Batch size (per device) for the evaluation dataloader.',
     )
     parser.add_argument(
@@ -137,6 +155,9 @@ def parse_args():
             "Only applicable when `--with_tracking` is passed."
         ),
     )
+    parser.add_argument('--project_name', type=str, default='EFL_implementation', help='wandb project name')
+    parser.add_argument('--run_name', type=str, default='kornli-baseline', help='wandb run name')
+    parser.add_argument('--entity', type=str, default=None, help='wandb entity')
     parser.add_argument(
         '--ignore_mismatched_sizes',
         action='store_true',
@@ -147,9 +168,10 @@ def parse_args():
     # output_dir 재정의
     args.output_dir = os.path.join(project_dir, args.output_dir)
     # TRoBERTa 사용시
-    args.model_name_or_path = os.path.join(project_dir, args.model_name_or_path)
-    args.vocab_path = os.path.join(project_dir, args.vocab_path)
-
+    if os.path.isdir(os.path.join(project_dir, args.model_name_or_path)):
+        args.model_name_or_path = os.path.join(project_dir, args.model_name_or_path)
+    if os.path.isdir(os.path.join(project_dir, args.vocab_path)):
+        args.vocab_path = os.path.join(project_dir, args.vocab_path)
 
     # Sanity checks
     if args.train_file is None and args.validation_file is None:
@@ -157,10 +179,10 @@ def parse_args():
     else:
         if args.train_file is not None:
             extension = args.train_file.split('.')[-1]
-            assert extension in ['csv', 'xlsx', 'tsv'], '`train_file` should be a csv or a xlsx file.'
+            assert extension in ['csv', 'json'], '`train_file` should be a csv or a json file.'
         if args.validation_file is not None:
             extension = args.validation_file.split('.')[-1]
-            assert extension in ['csv', 'xlsx', 'tsv'], '`validation_file` should be a csv a xlsx file.'
+            assert extension in ['csv', 'json'], '`validation_file` should be a csv a json file.'
 
     return args
 
@@ -188,17 +210,17 @@ def main():
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.output_dir is not None:
+        if not os.path.isdir(args.output_dir):
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
     # Get the datasets
-    # Loading the dataset from local csv or xlsx file.
+    # Loading the dataset from local csv or json file.
     data_files = {}
     if args.train_file is not None:
-        data_files['train'] = args.train_file
+        data_files['train'] = os.path.join(data_dir, args.train_file)
     if args.validation_file is not None:
-        data_files['validation'] = args.validation_file
+        data_files['validation'] = os.path.join(data_dir, args.validation_file)
     extension = (args.train_file if args.train_file is not None else args.validation_file).split('.')[-1]
     raw_datasets = load_dataset(extension, data_files=data_files)
 
@@ -214,9 +236,9 @@ def main():
         num_labels = len(label_list)
 
     # Load pretrained model and tokenizer
-    config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
-    if args.vocab_path:
-        tokenizer = AutoTokenizer.from_pretrained(args.vocab_path,
+    config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
+    if os.path.isdir(args.vocab_path):
+        tokenizer = BertTokenizer.from_pretrained(args.vocab_path,
                                                   do_lower_case=False,
                                                   unk_token='<unk>',
                                                   sep_token='</s>',
@@ -224,13 +246,17 @@ def main():
                                                   cls_token='<s>',
                                                   mask_token='<mask>',
                                                   model_max_length=args.max_length)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name_or_path,
-        from_tf=bool('.ckpt' in args.model_name_or_path),
-        config=config,
-        ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-    )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+    if os.path.isdir(args.model_name_or_path):
+        model = RobertaForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=num_labels)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool('.ckpt' in args.model_name_or_path),
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
 
     # Preprocessing the datasets
     non_label_column_names = [name for name in raw_datasets['train'].column_names if name != 'label']
@@ -255,7 +281,12 @@ def main():
         texts = (
             (examples[sentence1_key], ) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
         )
-        result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
+        result = tokenizer(*texts,
+                           padding=padding,
+                           max_length=args.max_length,
+                           truncation=True,
+                           return_token_type_ids=False,
+                           )
 
         if 'label' in examples:
             # Map labels to IDs
@@ -264,12 +295,16 @@ def main():
         return result
 
     with accelerator.main_process_first():
-        processed_datasets = raw_datasets.map(
-            preprocess_function,
-            batched=True,
-            remove_columns=raw_datasets['train'].column_names,
-            desc='Running tokenizer on dataset',
-        )
+        if not os.path.isfile(os.path.join(data_dir, 'processed_datasets.pkl')):  # 7분 걸려서 미리 해두자
+            processed_datasets = raw_datasets.map(
+                preprocess_function,
+                batched=True,
+                remove_columns=raw_datasets['train'].column_names,
+                desc='Running tokenizer on dataset',
+            )
+            save_pickle(os.path.join(data_dir, 'processed_datasets.pkl'), processed_datasets)
+        else:
+            processed_datasets = load_pickle(os.path.join(data_dir, 'processed_datasets.pkl'))
 
     train_dataset = processed_datasets['train']
     eval_dataset = processed_datasets['validation']
@@ -318,7 +353,7 @@ def main():
 
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
-        optimzier=optimizer,
+        optimizer=optimizer,
         num_warmup_steps=args.num_warmup_steps,
         num_training_steps=args.max_train_steps,
     )
@@ -359,6 +394,9 @@ def main():
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
+    # wandb initialize
+    wandb.init(project=args.project_name, name=args.run_name, entity=args.entity, reinit=True)
+
     logger.info('***** Running training *****')
     logger.info(f'  Num examples = {len(train_dataset)}')
     logger.info(f'  Num Epochs = {args.num_train_epochs}')
@@ -368,7 +406,7 @@ def main():
     logger.info(f'  Total optimization steps = {args.max_train_steps}')
 
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(int(args.max_train_steps)), disable=not accelerator.is_local_main_process)
     completed_steps = 0
     starting_epoch = 0
 
@@ -404,6 +442,7 @@ def main():
                 if resume_step is not None and step < resume_step:
                     completed_steps += 1
                     continue
+
             outputs = model(**batch)
             loss = outputs.loss
             # We keep track of the loss at each epoch
@@ -460,6 +499,8 @@ def main():
                 },
                 step=completed_steps,
             )
+            wandb.log({'accuracy': eval_metric, 'train_loss': total_loss.item() / len(train_dataloader),
+                       'epoch': epoch, 'step': completed_steps})
 
         if epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
