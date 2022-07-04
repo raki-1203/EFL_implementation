@@ -14,7 +14,10 @@ def make_csv_dataset(file_name):
         raise ValueError('Only tsv or xlsx files can be used')
     if extension == 'tsv':
         df = pd.read_csv(file_path, sep='\t')
-        df = df.rename(columns={'gold_label': 'label'})
+        print(f'{file_name}\noriginal data shape -> {df.shape}')
+        df.dropna(inplace=True)
+        print(f'data shape after NaN data drop -> {df.shape}')
+        df.columns = ['sentence1', 'sentence2', 'label']
     elif extension == 'xlsx':
         df = pd.read_excel(file_path, engine='openpyxl')
         df = df[['Sentence', 'Emotion']]
