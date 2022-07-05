@@ -11,6 +11,7 @@ import torch
 from datasets import load_dataset, load_metric
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from sklearn.metrics import accuracy_score
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -87,13 +88,13 @@ def parse_args():
     parser.add_argument(
         '--per_device_train_batch_size',
         type=int,
-        default=25,
+        default=16,
         help='Batch size (per device) for the training dataloader.',
     )
     parser.add_argument(
         '--per_device_eval_batch_size',
         type=int,
-        default=128,
+        default=16,
         help='Batch size (per device) for the evaluation dataloader.',
     )
     parser.add_argument(
@@ -193,9 +194,8 @@ def main():
     # Initialize the acclerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
     # in the environment
-    accelerator = (
-        Accelerator(log_with=args.report_to, logging_dir=args.output_dir) if args.with_tracking else Accelerator()
-    )
+    accelerator = Accelerator()
+
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -310,8 +310,8 @@ def main():
     eval_dataset = processed_datasets['validation']
 
     # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f'Sample {index} of the training set: {train_dataset[index]}.')
+    # for index in random.sample(range(len(train_dataset)), 3):
+    #     logger.info(f'Sample {index} of the training set: {train_dataset[index]}.')
 
     # DataLoaders creation:
     if args.pad_to_max_length:
@@ -386,16 +386,18 @@ def main():
             experiment_config = vars(args)
             # TensorBoard cannot log Enums, need the raw value
             experiment_config['lr_scheduler_type'] = experiment_config['lr_scheduler_type'].value
-            accelerator.init_trackers('train', experiment_config)
+            # wandb initialize
+            wandb.init(project=args.project_name,
+                       name=args.run_name,
+                       entity=args.entity,
+                       config=experiment_config,
+                       reinit=True)
 
     # Get the metric function
     metric = load_metric('accuracy')
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    # wandb initialize
-    wandb.init(project=args.project_name, name=args.run_name, entity=args.entity, reinit=True)
 
     logger.info('***** Running training *****')
     logger.info(f'  Num examples = {len(train_dataset)}')
@@ -436,6 +438,7 @@ def main():
         model.train()
         if args.with_tracking:
             total_loss = 0
+            total_acc = 0
         for step, batch in enumerate(train_dataloader):
             # We need to skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == starting_epoch:
@@ -447,7 +450,11 @@ def main():
             loss = outputs.loss
             # We keep track of the loss at each epoch
             if args.with_tracking:
-                total_loss += loss.detach().float()
+                total_loss += loss.item()
+                predictions = outputs.logits.argmax(dim=-1)
+                total_acc += accuracy_score(batch['labels'].detach().cpu(), predictions.detach().cpu())
+                progress_bar.set_description(f'loss: {total_loss / (step + 1):.4f} | accuracy: {total_acc / (step + 1) * 100:.4f}%')
+                wandb.log({'train_loss': total_loss / (step + 1), 'train_acc': total_acc / (step + 1) * 100})
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
@@ -490,17 +497,12 @@ def main():
         logger.info(f'epoch {epoch}: {eval_metric}')
 
         if args.with_tracking:
-            accelerator.log(
-                {
-                    'accuracy': eval_metric,
-                    'train_loss': total_loss.item() / len(train_dataloader),
+            wandb.log({
+                    'accuracy': eval_metric['accuracy'],
+                    'train_loss': total_loss / len(train_dataloader),
                     'epoch': epoch,
                     'step': completed_steps,
-                },
-                step=completed_steps,
-            )
-            wandb.log({'accuracy': eval_metric, 'train_loss': total_loss.item() / len(train_dataloader),
-                       'epoch': epoch, 'step': completed_steps})
+                })
 
         if epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
@@ -541,6 +543,9 @@ def main():
     if args.output_dir is not None:
         with open(os.path.join(args.output_dir, 'all_results.json'), 'w') as f:
             json.dump({'eval_accuracy': eval_metric['accuracy']}, f)
+
+    if args.with_tracking:
+        wandb.finish()
 
 
 if __name__ == '__main__':
