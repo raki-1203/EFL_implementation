@@ -5,16 +5,16 @@ import math
 import os
 import sys
 import random
+import logging
 
 import wandb
+import numpy as np
 import torch
 from datasets import load_dataset, load_metric
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from sklearn.metrics import accuracy_score
 
-from accelerate import Accelerator
-from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from transformers import (
     AutoConfig,
@@ -44,7 +44,14 @@ os.environ['WANDB_SILENT'] = "true"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # Arrange GPU devices starting from 0
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Set the GPU 0 to use
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def parse_args():
@@ -125,6 +132,11 @@ def parse_args():
         choices=['linear', 'cosine', 'cosine_with_restarts', 'polynomial', 'constant', 'constant_with_warmup'],
     )
     parser.add_argument(
+        '--use_fp16',
+        action='store_true',
+        help='Number of updates steps to accumulate before performing a backward/update pass.',
+    )
+    parser.add_argument(
         '--num_warmup_steps', type=int, default=0, help='Number of steps for the warmup in the lr scheduler.'
     )
     parser.add_argument('--output_dir', type=str, default=None, help='Where to store the final model.')
@@ -191,28 +203,19 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Initialize the acclerator. We will let the accelerator handle device placement for us in this example.
-    # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
-    # in the environment
-    accelerator = Accelerator()
-
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt='%m/%d%Y %H:%M:%S',
         level=logging.INFO,
     )
-    logger.info(accelerator.state, main_process_only=False)
 
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
 
-    # Handle the repository creation
-    if accelerator.is_main_process:
-        if not os.path.isdir(args.output_dir):
-            os.makedirs(args.output_dir, exist_ok=True)
-    accelerator.wait_for_everyone()
+    if not os.path.isdir(args.output_dir):
+        os.makedirs(args.output_dir, exist_ok=True)
 
     # Get the datasets
     # Loading the dataset from local csv or json file.
@@ -258,6 +261,9 @@ def main():
             ignore_mismatched_sizes=args.ignore_mismatched_sizes,
         )
 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model.to(device)
+
     # Preprocessing the datasets
     non_label_column_names = [name for name in raw_datasets['train'].column_names if name != 'label']
     if 'sentence1' in non_label_column_names and 'sentence2' in non_label_column_names:
@@ -294,17 +300,16 @@ def main():
 
         return result
 
-    with accelerator.main_process_first():
-        if not os.path.isfile(os.path.join(data_dir, 'processed_datasets.pkl')):  # 7분 걸려서 미리 해두자
-            processed_datasets = raw_datasets.map(
-                preprocess_function,
-                batched=True,
-                remove_columns=raw_datasets['train'].column_names,
-                desc='Running tokenizer on dataset',
-            )
-            save_pickle(os.path.join(data_dir, 'processed_datasets.pkl'), processed_datasets)
-        else:
-            processed_datasets = load_pickle(os.path.join(data_dir, 'processed_datasets.pkl'))
+    if not os.path.isfile(os.path.join(data_dir, 'processed_datasets.pkl')):  # 7분 걸려서 미리 해두자
+        processed_datasets = raw_datasets.map(
+            preprocess_function,
+            batched=True,
+            remove_columns=raw_datasets['train'].column_names,
+            desc='Running tokenizer on dataset',
+        )
+        save_pickle(os.path.join(data_dir, 'processed_datasets.pkl'), processed_datasets)
+    else:
+        processed_datasets = load_pickle(os.path.join(data_dir, 'processed_datasets.pkl'))
 
     train_dataset = processed_datasets['train']
     eval_dataset = processed_datasets['validation']
@@ -322,7 +327,7 @@ def main():
         # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
         # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
         # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None))
+        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if args.use_fp16 else None))
 
     train_dataloader = DataLoader(
         train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
@@ -358,11 +363,6 @@ def main():
         num_training_steps=args.max_train_steps,
     )
 
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-    )
-
     # We need to recalculate our total training steps as the size of the training dataloader may have changed
     num_update_steps_per_epoch = math.ceil(len(train_dataloader)) / args.gradient_accumulation_steps
     if overrode_max_train_steps:
@@ -370,7 +370,6 @@ def main():
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # Figure out how many steps we should save the Accelerator states
     if hasattr(args.checkpointing_steps, 'isdigit'):
         checkpointing_steps = args.checkpointing_steps
         if args.checkpointing_steps.isdigit():
@@ -379,25 +378,22 @@ def main():
         checkpointing_steps = None
 
     # We need to initialize the trackers we use, and also store our configuration.
-    # We initialize the trackers only on main process because `accelerator.log`
-    # only logs on main process and we don't want empty logs/runs on other processes.
     if args.with_tracking:
-        if accelerator.is_main_process:
-            experiment_config = vars(args)
-            # TensorBoard cannot log Enums, need the raw value
-            experiment_config['lr_scheduler_type'] = experiment_config['lr_scheduler_type'].value
-            # wandb initialize
-            wandb.init(project=args.project_name,
-                       name=args.run_name,
-                       entity=args.entity,
-                       config=experiment_config,
-                       reinit=True)
+        experiment_config = vars(args)
+        # TensorBoard cannot log Enums, need the raw value
+        experiment_config['lr_scheduler_type'] = experiment_config['lr_scheduler_type'].value
+        # wandb initialize
+        wandb.init(project=args.project_name,
+                   name=args.run_name,
+                   entity=args.entity,
+                   config=experiment_config,
+                   reinit=True)
 
     # Get the metric function
     metric = load_metric('accuracy')
 
     # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
 
     logger.info('***** Running training *****')
     logger.info(f'  Num examples = {len(train_dataset)}')
@@ -408,55 +404,35 @@ def main():
     logger.info(f'  Total optimization steps = {args.max_train_steps}')
 
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(int(args.max_train_steps)), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(int(args.max_train_steps)))
     completed_steps = 0
     starting_epoch = 0
 
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != '':
-            accelerator.print(f'Resumed from checkpoint: {args.resume_from_checkpoint}')
-            accelerator.load_state(args.resume_from_checkpoint)
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-            dirs.sort(key=os.path.getctime)
-            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
-        # Extract `epoch_{i}` or `step_{i}`
-        training_difference = os.path.splitext(path)[0]
-
-        if 'epoch' in training_difference:
-            starting_epoch = int(training_difference.replace('epoch_', '')) + 1
-            resume_step = None
-        else:
-            resume_step = int(training_difference.replace('step_', '')) + 1
-            starting_epoch = resume_step // len(train_dataloader)
-            resume_step -= starting_epoch * len(train_dataloader)
+    if isinstance(checkpointing_steps, int):
+        best_checkpoining_steps = None
+        best_valid_loss = float('inf')
 
     for epoch in range(starting_epoch, args.num_train_epochs):
+        print(f'\n{epoch+1} epoch start!')
         model.train()
         if args.with_tracking:
             total_loss = 0
-            total_acc = 0
+            total_correct = 0
         for step, batch in enumerate(train_dataloader):
-            # We need to skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == starting_epoch:
-                if resume_step is not None and step < resume_step:
-                    completed_steps += 1
-                    continue
+            batch = {k: v.to(device) for k, v in batch.items()}
 
             outputs = model(**batch)
             loss = outputs.loss
             # We keep track of the loss at each epoch
             if args.with_tracking:
                 total_loss += loss.item()
-                predictions = outputs.logits.argmax(dim=-1)
-                total_acc += accuracy_score(batch['labels'].detach().cpu(), predictions.detach().cpu())
-                progress_bar.set_description(f'loss: {total_loss / (step + 1):.4f} | accuracy: {total_acc / (step + 1) * 100:.4f}%')
-                wandb.log({'train_loss': total_loss / (step + 1), 'train_acc': total_acc / (step + 1) * 100})
+                predictions = outputs.logits.detach().cpu().argmax(dim=-1)
+                total_correct += torch.sum(batch['labels'].cpu() == predictions)
+                cur_step_acc = total_correct / ((step + 1) * args.per_device_train_batch_size) * 100
+                progress_bar.set_description(f'loss: {total_loss / (step + 1):.4f} | accuracy: {cur_step_acc:.4f}%')
+                wandb.log({'train_loss': total_loss / (step + 1), 'train_acc': cur_step_acc})
             loss = loss / args.gradient_accumulation_steps
-            accelerator.backward(loss)
+            loss.backward(loss)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
                 lr_scheduler.step()
@@ -466,83 +442,80 @@ def main():
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
-                    output_dir = f'step_{completed_steps}'
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
-                    accelerator.save_state(output_dir)
+                    model.eval()
+                    eval_total_loss = 0
+                    eval_total_correct = 0
+                    for step, batch in enumerate(tqdm(eval_dataloader, desc='evaluate')):
+                        batch = {k: v.to(device) for k, v in batch.items()}
+
+                        with torch.no_grad():
+                            outputs = model(**batch)
+
+                        loss = outputs.loss
+                        eval_total_loss += loss.item()
+                        predictions = outputs.logits.argmax(dim=-1).cpu()
+                        eval_total_correct += torch.sum(batch['labels'].cpu() == predictions)
+
+                    if args.with_tracking:
+                        train_acc = total_correct / (len(train_dataloader) * args.per_device_train_batch_size)
+                        train_loss = total_loss / len(train_dataloader)
+                        valid_acc = eval_total_correct / (len(eval_dataloader) * args.per_device_eval_batch_size) * 100
+                        valid_loss = eval_total_loss / len(eval_dataloader)
+                        logger.info(f'epoch {epoch} | eval_accuracy: {valid_acc:.4f} | eval_loss: {valid_loss:.6f}')
+                        wandb.log({
+                            'train_acc': train_acc,
+                            'train_loss': train_loss,
+                            'valid_acc': valid_acc,
+                            'valid_loss': valid_loss,
+                        })
+
+                    if best_valid_loss > valid_loss:
+                        best_valid_loss = valid_loss
+                        best_checkpoining_steps = checkpointing_steps
+                        output_dir = f'step_{completed_steps}'
+                        if args.output_dir is not None:
+                            output_dir = os.path.join(args.output_dir, output_dir)
+                        model.save_pretrained(output_dir)
+                        tokenizer.save_pretrained(output_dir)
 
             if completed_steps >= args.max_train_steps:
                 break
 
-        model.eval()
-        samples_seen = 0
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            predictions, references = accelerator.gather((predictions, batch['labels']))
-            # If we are in a multiprocess environment, the last batch has duplicates
-            if accelerator.num_processes > 1:
-                if step == len(eval_dataloader) - 1:
-                    predictions = predictions[:len(eval_dataloader.dataset) - samples_seen]
-                    references = references[:len(eval_dataloader.dataset) - samples_seen]
-                else:
-                    samples_seen += references.shape[0]
-            metric.add_batch(
-                predictions=predictions,
-                references=references,
-            )
-
-        eval_metric = metric.compute()
-        logger.info(f'epoch {epoch}: {eval_metric}')
-
-        if args.with_tracking:
-            wandb.log({
-                    'accuracy': eval_metric['accuracy'],
-                    'train_loss': total_loss / len(train_dataloader),
-                    'epoch': epoch,
-                    'step': completed_steps,
-                })
-
-        if epoch < args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-
-        if args.checkpointing_steps == 'epoch':
-            output_dir = f'epoch_{epoch}'
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir)
+        # if epoch < args.num_train_epochs - 1:
+        #     model.save_pretrained(args.output_dir)
+        #     tokenizer.save_pretrained(args.output_dir)
+        #
+        # if args.checkpointing_steps == 'epoch':
+        #     output_dir = f'epoch_{epoch}'
+        #     if args.output_dir is not None:
+        #         output_dir = os.path.join(args.output_dir, output_dir)
+        #     model.save_pretrained(output_dir)
 
     if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-        )
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
+        model.save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+
+    # load model at best checkpoint step
+    model.from_pretrained(os.path.join(args.output_dir, f'step_{best_checkpoining_steps}'))
 
     # Final evaluation on kornli validation set
     model.eval()
+    eval_total_correct = 0
     for step, batch in enumerate(eval_dataloader):
-        outputs = model(**batch)
-        predictions = outputs.logits.argmax(dim=-1)
-        metric.add_batch(
-            predictions=accelerator.gather(predictions),
-            references=accelerator.gather(batch['labels']),
-        )
-    eval_metric = metric.compute()
-    logger.info(f'kornli: {eval_metric}')
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        with torch.no_grad():
+            outputs = model(**batch)
+
+        predictions = outputs.logits.argmax(dim=-1).cpu()
+        eval_total_correct += torch.sum(batch['labels'].cpu() == predictions)
+
+    valid_acc = eval_total_correct / (len(eval_dataloader) * args.per_device_eval_batch_size) * 100
+    logger.info(f'\nxnli devset: accuracy: {valid_acc:.4f}')
 
     if args.output_dir is not None:
         with open(os.path.join(args.output_dir, 'all_results.json'), 'w') as f:
-            json.dump({'eval_accuracy': eval_metric['accuracy']}, f)
+            json.dump({'eval_accuracy': valid_acc}, f)
 
     if args.with_tracking:
         wandb.finish()
