@@ -206,7 +206,7 @@ def main():
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt='%m/%d%Y %H:%M:%S',
+        datefmt='%Y/%m/%d %H:%M:%S',
         level=logging.INFO,
     )
 
@@ -432,7 +432,7 @@ def main():
                 progress_bar.set_description(f'loss: {total_loss / (step + 1):.4f} | accuracy: {cur_step_acc:.4f}%')
                 wandb.log({'train_loss': total_loss / (step + 1), 'train_acc': cur_step_acc})
             loss = loss / args.gradient_accumulation_steps
-            loss.backward(loss)
+            loss.backward()
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
                 lr_scheduler.step()
