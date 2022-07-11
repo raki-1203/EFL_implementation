@@ -34,8 +34,7 @@ data_dir = os.path.join(project_dir, 'data')
 
 sys.path.append(project_dir)
 
-from src.utils import save_pickle, load_pickle
-
+from src.utils import save_pickle, load_pickle, AverageMeter
 
 # wandb description silent
 os.environ['WANDB_SILENT'] = "true"
@@ -397,9 +396,6 @@ def main():
                    config=experiment_config,
                    reinit=True)
 
-    # Get the metric function
-    metric = load_metric('accuracy')
-
     # Train!
     total_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
 
@@ -421,12 +417,15 @@ def main():
         best_valid_loss = float('inf')
 
     for epoch in range(starting_epoch, args.num_train_epochs):
-        print(f'\n{epoch+1} epoch start!')
-        model.train()
+        print(f'\n{epoch + 1} epoch start!')
+        torch.cuda.empty_cache()
+
         if args.with_tracking:
             total_loss = 0
             total_correct = 0
         for step, batch in enumerate(train_dataloader):
+            model.train()
+
             batch = {k: v.to(device) for k, v in batch.items()}
 
             outputs = model(**batch)
