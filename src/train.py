@@ -169,7 +169,7 @@ def parse_args():
         ),
     )
     parser.add_argument('--project_name', type=str, default='EFL_implementation', help='wandb project name')
-    parser.add_argument('--run_name', type=str, default='kornli-baseline', help='wandb run name')
+    parser.add_argument('--run_name', type=str, default='test', help='wandb run name')
     parser.add_argument('--entity', type=str, default=None, help='wandb entity')
     parser.add_argument(
         '--ignore_mismatched_sizes',
@@ -183,8 +183,9 @@ def parse_args():
     # TRoBERTa 사용시
     if os.path.isdir(os.path.join(project_dir, args.model_name_or_path)):
         args.model_name_or_path = os.path.join(project_dir, args.model_name_or_path)
-    if os.path.isdir(os.path.join(project_dir, args.vocab_path)):
-        args.vocab_path = os.path.join(project_dir, args.vocab_path)
+    if args.vocab_path:
+        if os.path.isdir(os.path.join(project_dir, args.vocab_path)):
+            args.vocab_path = os.path.join(project_dir, args.vocab_path)
 
     # Sanity checks
     if args.train_file is None and args.validation_file is None:
@@ -240,7 +241,7 @@ def main():
 
     # Load pretrained model and tokenizer
     config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
-    if os.path.isdir(args.vocab_path):
+    if args.vocab_path is not None and os.path.isdir(args.vocab_path):
         tokenizer = BertTokenizer.from_pretrained(args.vocab_path,
                                                   do_lower_case=False,
                                                   unk_token='<unk>',
@@ -310,6 +311,13 @@ def main():
         save_pickle(os.path.join(data_dir, 'processed_datasets.pkl'), processed_datasets)
     else:
         processed_datasets = load_pickle(os.path.join(data_dir, 'processed_datasets.pkl'))
+
+    processed_datasets = raw_datasets.map(
+        preprocess_function,
+        batched=True,
+        remove_columns=raw_datasets['train'].column_names,
+        desc='Running tokenizer on dataset',
+    )
 
     train_dataset = processed_datasets['train']
     eval_dataset = processed_datasets['validation']
