@@ -1,6 +1,5 @@
 import argparse
 import json
-import logging
 import math
 import os
 import sys
@@ -10,10 +9,11 @@ import logging
 import wandb
 import numpy as np
 import torch
-from datasets import load_dataset, load_metric
+from datasets import load_from_disk
+from torch import nn
+from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from sklearn.metrics import accuracy_score
 
 from accelerate.utils import set_seed
 from transformers import (
@@ -28,13 +28,12 @@ from transformers import (
     get_scheduler,
 )
 
-
 project_dir = os.path.dirname(os.path.dirname(__file__))
 data_dir = os.path.join(project_dir, 'data')
 
 sys.path.append(project_dir)
 
-from src.utils import save_pickle, load_pickle, AverageMeter
+from src.utils import save_pickle, load_pickle, AverageMeter, make_dataset
 
 # wandb description silent
 os.environ['WANDB_SILENT'] = "true"
@@ -60,6 +59,9 @@ def parse_args():
     )
     parser.add_argument(
         '--validation_file', type=str, default=None, help='A csv or a json file containing the validation data.'
+    )
+    parser.add_argument(
+        '--test_file', type=str, default=None, help='A csv or a json file containing the validation data.'
     )
     parser.add_argument(
         '--max_length',
@@ -106,7 +108,7 @@ def parse_args():
     parser.add_argument(
         '--learning_rate',
         type=float,
-        default=5e-5,
+        default=1e-3,
         help="initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay to use.')
@@ -134,6 +136,12 @@ def parse_args():
         '--use_fp16',
         action='store_true',
         help='Number of updates steps to accumulate before performing a backward/update pass.',
+    )
+    parser.add_argument(
+        '--device',
+        type=str,
+        default='cuda' if torch.cuda.is_available() else 'cpu',
+        help='using cpu or gpu',
     )
     parser.add_argument(
         '--num_warmup_steps', type=int, default=0, help='Number of steps for the warmup in the lr scheduler.'
@@ -200,6 +208,74 @@ def parse_args():
     return args
 
 
+def get_dataloader(args, datasets, tokenizer, padding, label_to_id):
+    # Preprocessing the datasets
+    non_label_column_names = [name for name in datasets['train'].column_names if name != 'label']
+    if 'sentence1' in non_label_column_names and 'sentence2' in non_label_column_names:
+        sentence1_key, sentence2_key = 'sentence1', 'sentence2'
+    else:
+        if len(non_label_column_names) >= 2:
+            sentence1_key, sentence2_key = non_label_column_names[:2]
+        else:
+            sentence1_key, sentence2_key = non_label_column_names[0], None
+
+    def preprocess_function(examples):
+        # Tokenize the texts
+        texts = (
+            (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
+        )
+        result = tokenizer(*texts,
+                           padding=padding,
+                           max_length=args.max_length,
+                           truncation=True,
+                           return_token_type_ids=False,
+                           )
+
+        if 'label' in examples:
+            # Map labels to IDs
+            result['labels'] = [label_to_id[l] for l in examples['label']]
+
+        return result
+
+    # DataLoaders creation:
+    if args.pad_to_max_length:
+        # If padding was already done or max length, we use the default data collator that will just convert everything
+        # to tensors.
+        data_collator = default_data_collator
+    else:
+        # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
+        # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
+        # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
+        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if args.use_fp16 else None))
+
+    dataloader_list = []
+    for k in ['train', 'validation', 'test']:
+        k_dataset = datasets[k]
+
+        k_dataset = k_dataset.map(
+            preprocess_function,
+            batched=True,
+            remove_columns=datasets['train'].column_names,
+            desc='Running tokenizer on dataset',
+        )
+
+        if k == 'train':
+            k_dataloader = DataLoader(k_dataset,
+                                      collate_fn=data_collator,
+                                      batch_size=args.per_device_train_batch_size,
+                                      shuffle=True,
+                                      )
+        else:
+            k_dataloader = DataLoader(k_dataset,
+                                      collate_fn=data_collator,
+                                      batch_size=args.per_device_train_batch_size,
+                                      )
+
+        dataloader_list.append(k_dataloader)
+
+    return dataloader_list
+
+
 def main():
     args = parse_args()
 
@@ -219,13 +295,9 @@ def main():
 
     # Get the datasets
     # Loading the dataset from local csv or json file.
-    data_files = {}
-    if args.train_file is not None:
-        data_files['train'] = os.path.join(data_dir, args.train_file)
-    if args.validation_file is not None:
-        data_files['validation'] = os.path.join(data_dir, args.validation_file)
-    extension = (args.train_file if args.train_file is not None else args.validation_file).split('.')[-1]
-    raw_datasets = load_dataset(extension, data_files=data_files)
+    if not os.path.exists(os.path.join(data_dir, 'kornli_dataset')):
+        make_dataset(args)
+    raw_datasets = load_from_disk(os.path.join(data_dir, 'kornli_dataset'))
 
     # Labels
     # Trying to have good defaults here, don't hesitate to tweak to your needs.
@@ -261,18 +333,7 @@ def main():
             ignore_mismatched_sizes=args.ignore_mismatched_sizes,
         )
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device)
-
-    # Preprocessing the datasets
-    non_label_column_names = [name for name in raw_datasets['train'].column_names if name != 'label']
-    if 'sentence1' in non_label_column_names and 'sentence2' in non_label_column_names:
-        sentence1_key, sentence2_key = 'sentence1', 'sentence2'
-    else:
-        if len(non_label_column_names) >= 2:
-            sentence1_key, sentence2_key = non_label_column_names[:2]
-        else:
-            sentence1_key, sentence2_key = non_label_column_names[0], None
+    model.to(args.device)
 
     # Some models have set the order of the labels to use, so let's make sure we do use it.
     label_to_id = {v: i for i, v in enumerate(label_list)}
@@ -282,64 +343,7 @@ def main():
 
     padding = 'max_length' if args.pad_to_max_length else False
 
-    def preprocess_function(examples):
-        # Tokenize the texts
-        texts = (
-            (examples[sentence1_key], ) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
-        )
-        result = tokenizer(*texts,
-                           padding=padding,
-                           max_length=args.max_length,
-                           truncation=True,
-                           return_token_type_ids=False,
-                           )
-
-        if 'label' in examples:
-            # Map labels to IDs
-            result['labels'] = [label_to_id[l] for l in examples['label']]
-
-        return result
-
-    if not os.path.isfile(os.path.join(data_dir, 'processed_datasets.pkl')):  # 7분 걸려서 미리 해두자
-        processed_datasets = raw_datasets.map(
-            preprocess_function,
-            batched=True,
-            remove_columns=raw_datasets['train'].column_names,
-            desc='Running tokenizer on dataset',
-        )
-        save_pickle(os.path.join(data_dir, 'processed_datasets.pkl'), processed_datasets)
-    else:
-        processed_datasets = load_pickle(os.path.join(data_dir, 'processed_datasets.pkl'))
-
-    processed_datasets = raw_datasets.map(
-        preprocess_function,
-        batched=True,
-        remove_columns=raw_datasets['train'].column_names,
-        desc='Running tokenizer on dataset',
-    )
-
-    train_dataset = processed_datasets['train']
-    eval_dataset = processed_datasets['validation']
-
-    # Log a few random samples from the training set:
-    # for index in random.sample(range(len(train_dataset)), 3):
-    #     logger.info(f'Sample {index} of the training set: {train_dataset[index]}.')
-
-    # DataLoaders creation:
-    if args.pad_to_max_length:
-        # If padding was already done or max length, we use the default data collator that will just convert everything
-        # to tensors.
-        data_collator = default_data_collator
-    else:
-        # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
-        # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
-        # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if args.use_fp16 else None))
-
-    train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
-    )
-    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+    train_dataloader, eval_dataloader, test_dataloader = get_dataloader(args, raw_datasets, tokenizer, padding, label_to_id)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -355,6 +359,7 @@ def main():
         }
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    criterion = nn.CrossEntropyLoss()
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -400,132 +405,146 @@ def main():
     total_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
 
     logger.info('***** Running training *****')
-    logger.info(f'  Num examples = {len(train_dataset)}')
+    logger.info(f'  Num examples = {len(raw_datasets["train"])}')
     logger.info(f'  Num Epochs = {args.num_train_epochs}')
     logger.info(f'  Instantaneous batch size per device = {args.per_device_train_batch_size}')
     logger.info(f'  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}')
     logger.info(f'  Gradient Accumulation steps = {args.gradient_accumulation_steps}')
     logger.info(f'  Total optimization steps = {args.max_train_steps}')
 
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(int(args.max_train_steps)))
-    completed_steps = 0
-    starting_epoch = 0
+    global_step = 0
+    if args.with_tracking:
+        train_loss = AverageMeter()
+        train_acc = AverageMeter()
 
     if isinstance(checkpointing_steps, int):
         best_checkpoining_steps = None
         best_valid_loss = float('inf')
 
-    for epoch in range(starting_epoch, args.num_train_epochs):
+    for epoch in range(args.num_train_epochs):
         print(f'\n{epoch + 1} epoch start!')
         torch.cuda.empty_cache()
 
-        if args.with_tracking:
-            total_loss = 0
-            total_correct = 0
-        for step, batch in enumerate(train_dataloader):
-            model.train()
+        train_iterator = tqdm(train_dataloader, desc='train-Iteration')
+        for step, batch in enumerate(train_iterator):
+            loss, acc = training_per_step(args, batch, model, optimizer, criterion, global_step)
+            train_loss.update(loss, args.per_device_train_batch_size)
+            train_acc.update(acc / args.per_device_train_batch_size)
+            global_step += 1
+            description = f'{epoch + 1}epoch {global_step: >5d}step | loss: {train_loss.avg:.4f} | acc: {train_acc.avg:.4f} | best_loss: {best_valid_loss:.4f}'
+            train_iterator.set_description(description)
 
-            batch = {k: v.to(device) for k, v in batch.items()}
-
-            outputs = model(**batch)
-            loss = outputs.loss
-            # We keep track of the loss at each epoch
             if args.with_tracking:
-                total_loss += loss.item()
-                predictions = outputs.logits.detach().cpu().argmax(dim=-1)
-                total_correct += torch.sum(batch['labels'].cpu() == predictions)
-                cur_step_acc = total_correct / ((step + 1) * args.per_device_train_batch_size) * 100
-                progress_bar.set_description(f'loss: {total_loss / (step + 1):.4f} | accuracy: {cur_step_acc:.4f}%')
-                wandb.log({'train_loss': total_loss / (step + 1), 'train_acc': cur_step_acc})
-            loss = loss / args.gradient_accumulation_steps
-            loss.backward()
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                progress_bar.update(1)
-                completed_steps += 1
+                last_lr = lr_scheduler.get_last_lr()[0]
+                wandb.log({
+                    'train/loss': train_loss.avg,
+                    'train/acc': train_acc.avg,
+                    'train/learning_rate': last_lr,
+                })
 
             if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
-                    model.eval()
-                    eval_total_loss = 0
-                    eval_total_correct = 0
-                    for step, batch in enumerate(tqdm(eval_dataloader, desc='evaluate')):
-                        batch = {k: v.to(device) for k, v in batch.items()}
+                if global_step % (checkpointing_steps * args.gradient_accumulation_steps) == 0:
+                    with torch.no_grad():
+                        valid_loss, valid_acc = evaluating(args, eval_dataloader, model, criterion)
 
-                        with torch.no_grad():
-                            outputs = model(**batch)
+                        lr_scheduler.step()
 
-                        loss = outputs.loss
-                        eval_total_loss += loss.item()
-                        predictions = outputs.logits.argmax(dim=-1).cpu()
-                        eval_total_correct += torch.sum(batch['labels'].cpu() == predictions)
+                        if valid_loss < best_valid_loss:
+                            best_valid_loss = valid_loss
+                            best_checkpoining_steps = checkpointing_steps
+                            output_dir = f'step_{global_step}'
+                            if args.output_dir is not None:
+                                output_dir = os.path.join(args.output_dir, output_dir)
+                            model.save_pretrained(output_dir)
+                            tokenizer.save_pretrained(output_dir)
 
                     if args.with_tracking:
-                        train_acc = total_correct / (len(train_dataloader) * args.per_device_train_batch_size)
-                        train_loss = total_loss / len(train_dataloader)
-                        valid_acc = eval_total_correct / (len(eval_dataloader) * args.per_device_eval_batch_size) * 100
-                        valid_loss = eval_total_loss / len(eval_dataloader)
-                        logger.info(f'epoch {epoch} | eval_accuracy: {valid_acc:.4f} | eval_loss: {valid_loss:.6f}')
                         wandb.log({
-                            'train_acc': train_acc,
-                            'train_loss': train_loss,
-                            'valid_acc': valid_acc,
-                            'valid_loss': valid_loss,
+                            'train/loss': train_loss.avg,
+                            'train/acc': train_acc.avg,
+                            'train/learning_rate': last_lr,
+                            'eval/best_loss': best_valid_loss,
+                            'eval/loss': valid_loss,
+                            'eval/acc': valid_acc,
+                            'global_step': global_step,
                         })
+                        train_loss.reset()
+                        train_acc.reset()
 
-                    if best_valid_loss > valid_loss:
-                        best_valid_loss = valid_loss
-                        best_checkpoining_steps = checkpointing_steps
-                        output_dir = f'step_{completed_steps}'
-                        if args.output_dir is not None:
-                            output_dir = os.path.join(args.output_dir, output_dir)
-                        model.save_pretrained(output_dir)
-                        tokenizer.save_pretrained(output_dir)
-
-            if completed_steps >= args.max_train_steps:
+            if global_step >= args.max_train_steps:
                 break
-
-        # if epoch < args.num_train_epochs - 1:
-        #     model.save_pretrained(args.output_dir)
-        #     tokenizer.save_pretrained(args.output_dir)
-        #
-        # if args.checkpointing_steps == 'epoch':
-        #     output_dir = f'epoch_{epoch}'
-        #     if args.output_dir is not None:
-        #         output_dir = os.path.join(args.output_dir, output_dir)
-        #     model.save_pretrained(output_dir)
 
     if args.output_dir is not None:
         model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
 
     # load model at best checkpoint step
-    model.from_pretrained(os.path.join(args.output_dir, f'step_{best_checkpoining_steps}'))
+    model = model.from_pretrained(os.path.join(args.output_dir, f'step_{best_checkpoining_steps}'))
 
-    # Final evaluation on kornli validation set
-    model.eval()
-    eval_total_correct = 0
-    for step, batch in enumerate(eval_dataloader):
-        batch = {k: v.to(device) for k, v in batch.items()}
+    # Final evaluation on kornli test set
+    with torch.no_grad():
+        test_loss, test_acc = evaluating(args, test_dataloader, model, criterion)
 
-        with torch.no_grad():
-            outputs = model(**batch)
-
-        predictions = outputs.logits.argmax(dim=-1).cpu()
-        eval_total_correct += torch.sum(batch['labels'].cpu() == predictions)
-
-    valid_acc = eval_total_correct / (len(eval_dataloader) * args.per_device_eval_batch_size) * 100
-    logger.info(f'\nxnli devset: accuracy: {valid_acc:.4f}')
+    logger.info(f'\nxnli testset: accuracy: {test_acc:.4f}')
 
     if args.output_dir is not None:
         with open(os.path.join(args.output_dir, 'all_results.json'), 'w') as f:
-            json.dump({'eval_accuracy': valid_acc}, f)
+            json.dump({'test_accuracy': test_acc}, f)
 
     if args.with_tracking:
         wandb.finish()
+
+
+def training_per_step(args, batch, model, optimizer, criterion, global_step):
+    model.train()
+    with autocast():
+        batch = {k: v.to(args.device) for k, v in batch.items()}
+
+        outputs = model(**batch)
+
+        logits = outputs.logits
+        preds = torch.argmax(logits, dim=-1)
+
+        loss = criterion(logits, batch['labels'])
+        acc = torch.sum(preds.cpu() == batch['labels'].cpu())
+
+        loss.backward()
+        if (global_step + 1) % args.gradient_accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+    return loss.item(), acc.item()
+
+
+def evaluating(args, eval_dataloader, model, criterion):
+    model.eval()
+
+    # eval phase
+    eval_loss = AverageMeter()
+    eval_acc = AverageMeter()
+
+    eval_iterator = tqdm(eval_dataloader, desc='eval-Iteration')
+    for step, batch in enumerate(eval_iterator):
+        batch = {k: v.to(args.device) for k, v in batch.items()}
+
+        outputs = model(**batch)
+
+        logits = outputs.logits
+        preds = torch.argmax(logits, dim=-1)
+
+        loss = criterion(logits, batch['labels'])
+        acc = torch.sum(preds.cpu() == batch['labels'].cpu())
+
+        eval_loss.update(loss.item(), args.per_device_eval_batch_size)
+        eval_acc.update(acc.item() / args.per_device_eval_batch_size)
+
+        description = f'eval loss: {eval_loss.avg:.4f} | eval acc: {eval_acc.avg:.4f}'
+        eval_iterator.set_description(description)
+
+    eval_loss = eval_loss.avg
+    eval_acc = eval_acc.avg
+
+    return eval_loss, eval_acc
 
 
 if __name__ == '__main__':
