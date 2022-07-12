@@ -412,7 +412,8 @@ def main():
     logger.info(f'  Gradient Accumulation steps = {args.gradient_accumulation_steps}')
     logger.info(f'  Total optimization steps = {args.max_train_steps}')
 
-    global_step = 0
+    global_step = 1
+    updated_step = 0
     if args.with_tracking:
         train_loss = AverageMeter()
         train_acc = AverageMeter()
@@ -427,7 +428,7 @@ def main():
 
         train_iterator = tqdm(train_dataloader, desc='train-Iteration')
         for step, batch in enumerate(train_iterator):
-            loss, acc = training_per_step(args, batch, model, optimizer, criterion, global_step)
+            loss, acc, updated_step = training_per_step(args, batch, model, optimizer, criterion, global_step, updated_step)
             train_loss.update(loss, args.per_device_train_batch_size)
             train_acc.update(acc / args.per_device_train_batch_size)
             global_step += 1
@@ -443,7 +444,7 @@ def main():
                 })
 
             if isinstance(checkpointing_steps, int):
-                if global_step % (checkpointing_steps * args.gradient_accumulation_steps) == 0:
+                if (updated_step + 1) % checkpointing_steps == 0:
                     with torch.no_grad():
                         valid_loss, valid_acc = evaluating(args, eval_dataloader, model, criterion)
 
@@ -451,8 +452,8 @@ def main():
 
                         if valid_loss < best_valid_loss:
                             best_valid_loss = valid_loss
-                            best_checkpoining_steps = checkpointing_steps
-                            output_dir = f'step_{global_step}'
+                            best_checkpoining_steps = updated_step
+                            output_dir = f'step_{best_checkpoining_steps}'
                             if args.output_dir is not None:
                                 output_dir = os.path.join(args.output_dir, output_dir)
                             model.save_pretrained(output_dir)
@@ -471,7 +472,7 @@ def main():
                         train_loss.reset()
                         train_acc.reset()
 
-            if global_step >= args.max_train_steps:
+            if updated_step >= args.max_train_steps:
                 break
 
     if args.output_dir is not None:
@@ -495,7 +496,7 @@ def main():
         wandb.finish()
 
 
-def training_per_step(args, batch, model, optimizer, criterion, global_step):
+def training_per_step(args, batch, model, optimizer, criterion, global_step, updated_step):
     model.train()
     with autocast():
         batch = {k: v.to(args.device) for k, v in batch.items()}
@@ -512,8 +513,9 @@ def training_per_step(args, batch, model, optimizer, criterion, global_step):
         if (global_step + 1) % args.gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
+            updated_step += 1
 
-    return loss.item(), acc.item()
+    return loss.item(), acc.item(), updated_step
 
 
 def evaluating(args, eval_dataloader, model, criterion):
