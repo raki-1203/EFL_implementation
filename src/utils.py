@@ -3,6 +3,7 @@ import pickle
 
 import pandas as pd
 from datasets import Features, Value, DatasetDict, Dataset
+from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
 
 project_dir = os.path.dirname(os.path.dirname(__file__))
 data_dir = os.path.join(project_dir, 'data')
@@ -54,3 +55,8 @@ def make_dataset(args):
                             'test': Dataset.from_pandas(test_df, features=f)})
 
     datasets.save_to_disk(os.path.join(data_dir, 'kornli_dataset'))
+
+
+class ReduceLROnPlateauPatch(ReduceLROnPlateau, _LRScheduler):
+    def get_last_lr(self):
+        return [group['lr'] for group in self.optimizer.param_groups]
