@@ -9,9 +9,11 @@ import logging
 import wandb
 import numpy as np
 import torch
+import transformers
 from datasets import load_from_disk
 from torch import nn
 from torch.cuda.amp import autocast
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -23,9 +25,7 @@ from transformers import (
     AutoTokenizer,
     BertTokenizer,
     DataCollatorWithPadding,
-    SchedulerType,
     default_data_collator,
-    get_scheduler,
 )
 
 project_dir = os.path.dirname(os.path.dirname(__file__))
@@ -33,7 +33,7 @@ data_dir = os.path.join(project_dir, 'data')
 
 sys.path.append(project_dir)
 
-from src.utils import save_pickle, load_pickle, AverageMeter, make_dataset
+from src.utils import AverageMeter, make_dataset, ReduceLROnPlateauPatch
 
 # wandb description silent
 os.environ['WANDB_SILENT'] = "true"
@@ -127,10 +127,10 @@ def parse_args():
     )
     parser.add_argument(
         '--lr_scheduler_type',
-        type=SchedulerType,
+        type=str,
         default='linear',
         help='The scheduler type to use.',
-        choices=['linear', 'cosine', 'cosine_with_restarts', 'polynomial', 'constant', 'constant_with_warmup'],
+        choices=['linear', 'ReduceLROnPlateau', 'CosineAnnealingLR'],
     )
     parser.add_argument(
         '--use_fp16',
@@ -358,8 +358,6 @@ def main():
             'weight_decay': 0.0,
         }
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-    criterion = nn.CrossEntropyLoss()
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -368,12 +366,17 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.max_train_steps,
-    )
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    criterion = nn.CrossEntropyLoss()
+    if args.lr_scheduler_type == 'linear':
+        lr_scheduler = transformers.optimization.get_linear_schedule_with_warmup(optimizer,
+                                                                                 num_warmup_steps=args.num_warmup_steps,
+                                                                                 num_training_steps=args.max_train_steps,
+                                                                                 )
+    elif args.lr_scheduler_type == 'ReduceLROnPlateau':
+        lr_scheduler = ReduceLROnPlateauPatch(optimizer, 'max', patience=10)
+    elif args.lr_scheduler_type == 'CosineAnnealingLR':
+        lr_scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-7)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed
     num_update_steps_per_epoch = math.ceil(len(train_dataloader)) / args.gradient_accumulation_steps
@@ -392,8 +395,6 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     if args.with_tracking:
         experiment_config = vars(args)
-        # TensorBoard cannot log Enums, need the raw value
-        experiment_config['lr_scheduler_type'] = experiment_config['lr_scheduler_type'].value
         # wandb initialize
         wandb.init(project=args.project_name,
                    name=args.run_name,
@@ -412,15 +413,13 @@ def main():
     logger.info(f'  Gradient Accumulation steps = {args.gradient_accumulation_steps}')
     logger.info(f'  Total optimization steps = {args.max_train_steps}')
 
-    global_step = 1
-    updated_step = 0
-    if args.with_tracking:
-        train_loss = AverageMeter()
-        train_acc = AverageMeter()
+    global_step = 0
+    train_loss = AverageMeter()
+    train_acc = AverageMeter()
 
     if isinstance(checkpointing_steps, int):
         best_checkpoining_steps = None
-        best_valid_loss = float('inf')
+        best_valid_acc = 0
 
     for epoch in range(args.num_train_epochs):
         print(f'\n{epoch + 1} epoch start!')
@@ -428,11 +427,11 @@ def main():
 
         train_iterator = tqdm(train_dataloader, desc='train-Iteration')
         for step, batch in enumerate(train_iterator):
-            loss, acc, updated_step = training_per_step(args, batch, model, optimizer, criterion, global_step, updated_step)
+            loss, acc = training_per_step(args, batch, model, optimizer, criterion, lr_scheduler, global_step)
             train_loss.update(loss, args.per_device_train_batch_size)
             train_acc.update(acc / args.per_device_train_batch_size)
             global_step += 1
-            description = f'{epoch + 1}epoch {global_step: >5d}step | loss: {train_loss.avg:.4f} | acc: {train_acc.avg:.4f} | best_loss: {best_valid_loss:.4f}'
+            description = f'{epoch + 1}epoch {int(global_step // args.gradient_accumulation_steps):>5d} / {int(args.max_train_steps):>6d}step | loss: {train_loss.avg:.4f} | acc: {train_acc.avg:.4f} | best_acc: {best_valid_acc:.4f}'
             train_iterator.set_description(description)
 
             if args.with_tracking:
@@ -444,15 +443,13 @@ def main():
                 })
 
             if isinstance(checkpointing_steps, int):
-                if (updated_step + 1) % checkpointing_steps == 0:
+                if global_step != 0 and (global_step / args.gradient_accumulation_steps) % checkpointing_steps == 0:
                     with torch.no_grad():
                         valid_loss, valid_acc = evaluating(args, eval_dataloader, model, criterion)
 
-                        lr_scheduler.step()
-
-                        if valid_loss < best_valid_loss:
-                            best_valid_loss = valid_loss
-                            best_checkpoining_steps = updated_step
+                        if valid_acc > best_valid_acc:
+                            best_valid_acc = valid_acc
+                            best_checkpoining_steps = global_step
                             output_dir = f'step_{best_checkpoining_steps}'
                             if args.output_dir is not None:
                                 output_dir = os.path.join(args.output_dir, output_dir)
@@ -464,7 +461,7 @@ def main():
                             'train/loss': train_loss.avg,
                             'train/acc': train_acc.avg,
                             'train/learning_rate': last_lr,
-                            'eval/best_loss': best_valid_loss,
+                            'eval/best_acc': best_valid_acc,
                             'eval/loss': valid_loss,
                             'eval/acc': valid_acc,
                             'global_step': global_step,
@@ -472,7 +469,7 @@ def main():
                         train_loss.reset()
                         train_acc.reset()
 
-            if updated_step >= args.max_train_steps:
+            if (global_step // args.gradient_accumulation_steps) >= args.max_train_steps:
                 break
 
     if args.output_dir is not None:
@@ -481,6 +478,7 @@ def main():
 
     # load model at best checkpoint step
     model = model.from_pretrained(os.path.join(args.output_dir, f'step_{best_checkpoining_steps}'))
+    model.to(args.device)
 
     # Final evaluation on kornli test set
     with torch.no_grad():
@@ -490,13 +488,13 @@ def main():
 
     if args.output_dir is not None:
         with open(os.path.join(args.output_dir, 'all_results.json'), 'w') as f:
-            json.dump({'test_accuracy': test_acc}, f)
+            json.dump({'best_step': best_checkpoining_steps, 'test_accuracy': test_acc}, f)
 
     if args.with_tracking:
         wandb.finish()
 
 
-def training_per_step(args, batch, model, optimizer, criterion, global_step, updated_step):
+def training_per_step(args, batch, model, optimizer, criterion, lr_scheduler, global_step):
     model.train()
     with autocast():
         batch = {k: v.to(args.device) for k, v in batch.items()}
@@ -513,9 +511,9 @@ def training_per_step(args, batch, model, optimizer, criterion, global_step, upd
         if (global_step + 1) % args.gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
-            updated_step += 1
+            lr_scheduler.step()
 
-    return loss.item(), acc.item(), updated_step
+    return loss.item(), acc.item()
 
 
 def evaluating(args, eval_dataloader, model, criterion):
