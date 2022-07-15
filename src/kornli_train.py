@@ -19,11 +19,6 @@ from tqdm.auto import tqdm
 
 from accelerate.utils import set_seed
 from transformers import (
-    AutoConfig,
-    AutoModelForSequenceClassification,
-    RobertaForSequenceClassification,
-    AutoTokenizer,
-    BertTokenizer,
     DataCollatorWithPadding,
     default_data_collator,
 )
@@ -33,7 +28,7 @@ data_dir = os.path.join(project_dir, 'data')
 
 sys.path.append(project_dir)
 
-from src.utils import AverageMeter, make_dataset, ReduceLROnPlateauPatch
+from src.utils import AverageMeter, make_dataset, ReduceLROnPlateauPatch, get_config_tokenizer_model
 
 # wandb description silent
 os.environ['WANDB_SILENT'] = "true"
@@ -62,6 +57,13 @@ def parse_args():
     )
     parser.add_argument(
         '--test_file', type=str, default=None, help='A csv or a json file containing the validation data.'
+    )
+    parser.add_argument(
+        '--task_dataset',
+        type=str,
+        default=None,
+        help='dataset name',
+        choices=['kornli', 'ksc'],
     )
     parser.add_argument(
         '--max_length',
@@ -311,39 +313,18 @@ def main():
         num_labels = len(label_list)
 
     # Load pretrained model and tokenizer
-    config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
-    if args.vocab_path is not None and os.path.isdir(args.vocab_path):
-        tokenizer = BertTokenizer.from_pretrained(args.vocab_path,
-                                                  do_lower_case=False,
-                                                  unk_token='<unk>',
-                                                  sep_token='</s>',
-                                                  pad_token='<pad>',
-                                                  cls_token='<s>',
-                                                  mask_token='<mask>',
-                                                  model_max_length=args.max_length)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
-    if os.path.isdir(args.model_name_or_path):
-        model = RobertaForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=num_labels)
-    else:
-        model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool('.ckpt' in args.model_name_or_path),
-            config=config,
-            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-        )
-
+    config, tokenizer, model = get_config_tokenizer_model(args, num_labels)
     model.to(args.device)
 
     # Some models have set the order of the labels to use, so let's make sure we do use it.
-    label_to_id = {v: i for i, v in enumerate(label_list)}
+    label_to_idx = {v: i for i, v in enumerate(label_list)}
 
-    model.config.label2id = label_to_id
-    model.config.id2label = {id: label for label, id in config.label2id.items()}
+    model.config.label2id = label_to_idx
+    model.config.id2label = {idx: label for label, idx in config.label2id.items()}
 
     padding = 'max_length' if args.pad_to_max_length else False
 
-    train_dataloader, eval_dataloader, test_dataloader = get_dataloader(args, raw_datasets, tokenizer, padding, label_to_id)
+    train_dataloader, eval_dataloader, test_dataloader = get_dataloader(args, raw_datasets, tokenizer, padding, label_to_idx)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
