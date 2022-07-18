@@ -4,30 +4,14 @@ import pandas as pd
 from datasets import Features, Value, DatasetDict, Dataset
 
 
-class DataProcessor(object):
-    """Base class for data converters for sequence classification datasets."""
+class KSCProcessor(object):
+    """Processor for the Korean Singular Conversation dataset"""
 
     def __init__(self, negative_num=1):
         # Random negative sample number for efl strategy
         self.neg_num = negative_num
 
-    def get_train_datasets(self, datasets, task_label_description):
-        """See base class."""
-        return self._create_examples(datasets, "train", task_label_description)
-
-    def get_dev_datasets(self, datasets, task_label_description):
-        """See base class."""
-        return self._create_examples(datasets, "dev", task_label_description)
-
-    def get_test_datasets(self, datasets, task_label_description):
-        """See base class."""
-        return self._create_examples(datasets, "test", task_label_description)
-
-
-class KSCProcessor(DataProcessor):
-    """Processor for the Korean Singular Conversation dataset"""
-
-    def _create_examples(self, datasets, task_label_description):
+    def create_examples(self, datasets, task_label_description):
         """Creates examples for the training and dev sets."""
 
         train_datasets = datasets['train']
