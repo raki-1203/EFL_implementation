@@ -8,11 +8,9 @@ import logging
 import wandb
 import numpy as np
 import torch
-import transformers
 from datasets import load_from_disk
 from torch import nn
 from torch.cuda.amp import autocast
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -22,12 +20,19 @@ from transformers import (
     default_data_collator,
 )
 
+
 project_dir = os.path.dirname(os.path.dirname(__file__))
 data_dir = os.path.join(project_dir, 'data')
 
 sys.path.append(project_dir)
 
-from src.utils import AverageMeter, make_dataset, ReduceLROnPlateauPatch, get_config_tokenizer_model
+from src.utils import (
+    AverageMeter,
+    make_dataset,
+    get_config_tokenizer_model,
+    get_optimizer_grouped_parameters,
+    get_lr_scheduler,
+)
 from src.arguments import parse_args
 
 # wandb description silent
@@ -107,7 +112,7 @@ def get_dataloader(args, datasets, tokenizer, padding, label_to_id):
         else:
             k_dataloader = DataLoader(k_dataset,
                                       collate_fn=data_collator,
-                                      batch_size=args.per_device_train_batch_size,
+                                      batch_size=args.per_device_eval_batch_size,
                                       )
 
         dataloader_list.append(k_dataloader)
@@ -165,17 +170,7 @@ def main():
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ['bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {
-            'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            'weight_decay': args.weight_decay,
-        },
-        {
-            'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            'weight_decay': 0.0,
-        }
-    ]
+    optimizer_grouped_parameters = get_optimizer_grouped_parameters(args, model)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -186,15 +181,7 @@ def main():
 
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
     criterion = nn.CrossEntropyLoss()
-    if args.lr_scheduler_type == 'linear':
-        lr_scheduler = transformers.optimization.get_linear_schedule_with_warmup(optimizer,
-                                                                                 num_warmup_steps=args.num_warmup_steps,
-                                                                                 num_training_steps=args.max_train_steps,
-                                                                                 )
-    elif args.lr_scheduler_type == 'ReduceLROnPlateau':
-        lr_scheduler = ReduceLROnPlateauPatch(optimizer, 'max', patience=10)
-    elif args.lr_scheduler_type == 'CosineAnnealingLR':
-        lr_scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-7)
+    lr_scheduler = get_lr_scheduler(args, optimizer)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed
     num_update_steps_per_epoch = math.ceil(len(train_dataloader)) / args.gradient_accumulation_steps
@@ -265,6 +252,9 @@ def main():
                     with torch.no_grad():
                         valid_loss, valid_acc = evaluating(args, eval_dataloader, model, criterion)
 
+                        if args.lr_scheduler_type == 'ReduceLROnPlateau':
+                            lr_scheduler.step(valid_acc)
+
                         if valid_acc > best_valid_acc:
                             best_valid_acc = valid_acc
                             best_checkpoining_steps = global_step
@@ -282,7 +272,6 @@ def main():
                             'eval/best_acc': best_valid_acc,
                             'eval/loss': valid_loss,
                             'eval/acc': valid_acc,
-                            'global_step': global_step,
                         })
                         train_loss.reset()
                         train_acc.reset()
@@ -290,19 +279,15 @@ def main():
             if (global_step // args.gradient_accumulation_steps) >= args.max_train_steps:
                 break
 
-    if args.output_dir is not None:
-        model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-
     # load model at best checkpoint step
     model = model.from_pretrained(os.path.join(args.output_dir, f'step_{best_checkpoining_steps}'))
     model.to(args.device)
 
-    # Final evaluation on kornli test set
+    # Final evaluation on test set
     with torch.no_grad():
         test_loss, test_acc = evaluating(args, test_dataloader, model, criterion)
 
-    logger.info(f'\nxnli testset: accuracy: {test_acc:.4f}')
+    logger.info(f'\n{args.task_dataset} test set: accuracy: {test_acc:.4f}')
 
     if args.output_dir is not None:
         with open(os.path.join(args.output_dir, 'all_results.json'), 'w') as f:
@@ -329,7 +314,8 @@ def training_per_step(args, batch, model, optimizer, criterion, lr_scheduler, gl
         if (global_step + 1) % args.gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
-            lr_scheduler.step()
+            if args.lr_scheduler_type != 'ReduceLROnPlateau':
+                lr_scheduler.step()
 
     return loss.item(), acc.item()
 
