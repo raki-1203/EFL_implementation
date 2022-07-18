@@ -10,8 +10,8 @@ data_dir = os.path.join(project_dir, 'data')
 def make_csv_dataset(file_name):
     file_path = os.path.join(data_dir, file_name)
     extension = file_path.split('.')[-1]
-    if extension not in ['tsv', 'xlsx']:
-        raise ValueError('Only tsv or xlsx files can be used')
+    if extension not in ['tsv', 'xlsx', 'txt']:
+        raise ValueError('Only tsv or xlsx or txt files can be used')
     if extension == 'tsv':
         df = pd.read_csv(file_path, sep='\t')
         print(f'{file_name}\noriginal data shape -> {df.shape}')
@@ -22,6 +22,11 @@ def make_csv_dataset(file_name):
         df = pd.read_excel(file_path, engine='openpyxl')
         df = df[['Sentence', 'Emotion']]
         df = df.rename(columns={'Sentence': 'sentence1', 'Emotion': 'label'})
+    elif extension == 'txt':
+        df = pd.read_csv(file_path, sep='\t')
+        df = df[['document', 'label']]
+        df.columns = ['sentence1', 'label']
+        df['label'] = df['label'].apply(lambda x: '긍정' if x == 1 else '부정')
 
     save_path = file_path[:-len(extension)] + 'csv'
     df.to_csv(save_path, index=False)
@@ -32,3 +37,5 @@ if __name__ == '__main__':
     make_csv_dataset(file_name='snli_1.0_train.ko.tsv')
     make_csv_dataset(file_name='xnli.dev.ko.tsv')
     make_csv_dataset(file_name='xnli.test.ko.tsv')
+    make_csv_dataset(file_name='ratings_train.txt')
+    make_csv_dataset(file_name='ratings_test.txt')
