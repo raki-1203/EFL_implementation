@@ -4,9 +4,10 @@ import pickle
 import pandas as pd
 from datasets import Features, Value, DatasetDict, Dataset
 from sklearn.model_selection import train_test_split
-from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
+from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler, CosineAnnealingLR
 from transformers import AutoConfig, BertTokenizer, AutoTokenizer, RobertaForSequenceClassification, \
-    AutoModelForSequenceClassification
+    AutoModelForSequenceClassification, get_linear_schedule_with_warmup
+
 
 project_dir = os.path.dirname(os.path.dirname(__file__))
 data_dir = os.path.join(project_dir, 'data')
@@ -112,3 +113,34 @@ def get_config_tokenizer_model(args, num_labels):
         )
 
     return config, tokenizer, model
+
+
+def get_optimizer_grouped_parameters(args, model):
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {
+            'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            'weight_decay': args.weight_decay,
+        },
+        {
+            'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            'weight_decay': 0.0,
+        }
+    ]
+
+    return optimizer_grouped_parameters
+
+
+def get_lr_scheduler(args, optimizer):
+    if args.lr_scheduler_type == 'linear':
+        lr_scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                       num_warmup_steps=args.num_warmup_steps,
+                                                       num_training_steps=args.max_train_steps,
+                                                       )
+    elif args.lr_scheduler_type == 'ReduceLROnPlateau':
+        lr_scheduler = ReduceLROnPlateauPatch(optimizer, 'max', patience=1, factor=0.9)
+    elif args.lr_scheduler_type == 'CosineAnnealingLR':
+        lr_scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-7)
+
+    return lr_scheduler
+

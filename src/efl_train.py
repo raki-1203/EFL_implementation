@@ -1,4 +1,3 @@
-import argparse
 import json
 import math
 from functools import partial
@@ -14,7 +13,6 @@ import torch
 from datasets import load_from_disk
 from torch import nn
 from torch.cuda.amp import autocast
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -22,18 +20,25 @@ from accelerate.utils import set_seed
 from transformers import (
     DataCollatorWithPadding,
     default_data_collator,
-    get_linear_schedule_with_warmup,
 )
+
 
 project_dir = os.path.dirname(os.path.dirname(__file__))
 data_dir = os.path.join(project_dir, 'data')
 
 sys.path.append(project_dir)
 
-from src.utils import AverageMeter, make_dataset, ReduceLROnPlateauPatch, get_config_tokenizer_model
+from src.utils import (
+    AverageMeter,
+    make_dataset,
+    get_config_tokenizer_model,
+    get_optimizer_grouped_parameters,
+    get_lr_scheduler,
+)
 from src.data import processor_dict
 from src.loss import RDropLoss
 from src.task_label_description import TASK_LABELS_DESC
+from src.arguments import parse_args
 
 # wandb description silent
 os.environ['WANDB_SILENT'] = "true"
@@ -50,180 +55,6 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Finetune a transformers model on a text classification task')
-    parser.add_argument(
-        '--train_file', type=str, default=None, help='A csv or a json file containing the training data.'
-    )
-    parser.add_argument(
-        '--validation_file', type=str, default=None, help='A csv or a json file containing the validation data.'
-    )
-    parser.add_argument(
-        '--test_file', type=str, default=None, help='A csv or a json file containing the validation data.'
-    )
-    parser.add_argument('--task_dataset',
-                        type=str,
-                        default=None,
-                        help='dataset name',
-                        choices=['kornli', 'ksc'],
-                        )
-    parser.add_argument("--negative_num",
-                        default=1,
-                        type=int,
-                        help="Random negative sample number for efl strategy")
-    parser.add_argument(
-        '--max_length',
-        type=int,
-        default=256,
-        help=(
-            "The maximum total input sequence length after tokenization. Sequences longer than this will be truncated,"
-            " sequences shorter will be padded if `--pad_to_max_length` is passed."
-        ),
-    )
-    parser.add_argument(
-        '--pad_to_max_length',
-        action='store_true',
-        help='If passed, pad all samples to `max_length`. Otherwise, dynamic padding is used.',
-    )
-    parser.add_argument(
-        '--model_name_or_path',
-        type=str,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=True,
-    )
-    parser.add_argument(
-        '--vocab_path',
-        type=str,
-        help="Path to pretrained tokenizer vocab",
-    )
-    parser.add_argument(
-        '--use_slow_tokenizer',
-        action='store_true',
-        help='If passed, will use a slow tokenizer (not backed by the Tokenizers library).',
-    )
-    parser.add_argument(
-        '--per_device_train_batch_size',
-        type=int,
-        default=16,
-        help='Batch size (per device) for the training dataloader.',
-    )
-    parser.add_argument(
-        '--per_device_eval_batch_size',
-        type=int,
-        default=128,
-        help='Batch size (per device) for the evaluation dataloader.',
-    )
-    parser.add_argument(
-        '--learning_rate',
-        type=float,
-        default=1e-3,
-        help="initial learning rate (after the potential warmup period) to use.",
-    )
-    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay to use.')
-    parser.add_argument('--num_train_epochs', type=int, default=3, help='Total number of training epochs to perform.')
-    parser.add_argument(
-        '--max_train_steps',
-        type=int,
-        default=None,
-        help='Total number of training steps to perform. If provided, overrides num_train_epochs.',
-    )
-    parser.add_argument(
-        '--gradient_accumulation_steps',
-        type=int,
-        default=1,
-        help='Number of updates steps to accumulate before performing a backward/update pass.',
-    )
-    parser.add_argument(
-        '--lr_scheduler_type',
-        type=str,
-        default='linear',
-        help='The scheduler type to use.',
-        choices=['linear', 'ReduceLROnPlateau', 'CosineAnnealingLR'],
-    )
-    parser.add_argument(
-        '--use_fp16',
-        action='store_true',
-        help='Number of updates steps to accumulate before performing a backward/update pass.',
-    )
-    parser.add_argument(
-        '--device',
-        type=str,
-        default='cuda' if torch.cuda.is_available() else 'cpu',
-        help='using cpu or gpu',
-    )
-    parser.add_argument(
-        '--num_warmup_steps', type=int, default=0, help='Number of steps for the warmup in the lr scheduler.'
-    )
-    parser.add_argument('--output_dir', type=str, default=None, help='Where to store the final model.')
-    parser.add_argument('--seed', type=int, default=None, help='A seed for reproducible training.')
-    parser.add_argument(
-        '--checkpointing_steps',
-        type=str,
-        default=None,
-        help='Whether the various states should be saved at the end of every n steps, or "epoch" for each epoch.',
-    )
-    parser.add_argument(
-        "--rdrop_coef",
-        default=0.0,
-        type=float,
-        help=
-        "The coefficient of KL-Divergence loss in R-Drop paper, for more detail please refer to "
-        "https://arxiv.org/abs/2106.14448), if rdrop_coef > 0 then R-Drop works"
-    )
-    parser.add_argument(
-        '--resume_from_checkpoint',
-        type=str,
-        default=None,
-        help='If the training should continue from a checkpoint folder.',
-    )
-    parser.add_argument(
-        '--with_tracking',
-        action='store_true',
-        help='Whether to enable experiment trackers for logging.',
-    )
-    parser.add_argument(
-        '--report_to',
-        type=str,
-        default='all',
-        help=(
-            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
-            ' `"wandb"` and `"comet_ml"`. Use `"all"` (default) to report to all integrations.'
-            "Only applicable when `--with_tracking` is passed."
-        ),
-    )
-    parser.add_argument('--project_name', type=str, default='EFL_implementation', help='wandb project name')
-    parser.add_argument('--run_name', type=str, default='test', help='wandb run name')
-    parser.add_argument('--entity', type=str, default=None, help='wandb entity')
-    parser.add_argument(
-        '--ignore_mismatched_sizes',
-        action='store_true',
-        help='Whether or not to enable to load a pretrained model whose head dimensions are different.',
-    )
-    args = parser.parse_args()
-
-    # output_dir 재정의
-    args.output_dir = os.path.join(project_dir, args.output_dir)
-    # TRoBERTa 사용시
-    if os.path.isdir(os.path.join(project_dir, args.model_name_or_path)):
-        args.model_name_or_path = os.path.join(project_dir, args.model_name_or_path)
-    if args.vocab_path:
-        if os.path.isdir(os.path.join(project_dir, args.vocab_path)):
-            args.vocab_path = os.path.join(project_dir, args.vocab_path)
-
-    # Sanity checks
-    if args.train_file is None and args.validation_file is None:
-        raise ValueError("Need a training/validation file.")
-    else:
-        if args.train_file is not None:
-            extension = args.train_file.split('.')[-1]
-            assert extension in ['csv', 'json'], '`train_file` should be a csv or a json file.'
-        if args.validation_file is not None:
-            extension = args.validation_file.split('.')[-1]
-            assert extension in ['csv', 'json'], '`validation_file` should be a csv a json file.'
-
-    return args
 
 
 def preprocess_function(examples, args, sentence_key, tokenizer, padding):
@@ -348,8 +179,8 @@ def main():
     model.config.id2label = {idx: label for label, idx in config.label2id.items()}
 
     processor = processor_dict[args.task_dataset](args.negative_num)
-    processed_dataset = processor._create_examples(raw_datasets,
-                                                   TASK_LABELS_DESC[args.task_dataset])
+    processed_dataset = processor.create_examples(raw_datasets,
+                                                  TASK_LABELS_DESC[args.task_dataset])
 
     padding = 'max_length' if args.pad_to_max_length else False
 
@@ -357,17 +188,7 @@ def main():
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ['bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {
-            'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            'weight_decay': args.weight_decay,
-        },
-        {
-            'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            'weight_decay': 0.0,
-        }
-    ]
+    optimizer_grouped_parameters = get_optimizer_grouped_parameters(args, model)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -393,15 +214,7 @@ def main():
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
     criterion = nn.CrossEntropyLoss()
     rdrop_loss = RDropLoss()
-    if args.lr_scheduler_type == 'linear':
-        lr_scheduler = get_linear_schedule_with_warmup(optimizer,
-                                                       num_warmup_steps=args.num_warmup_steps,
-                                                       num_training_steps=args.max_train_steps,
-                                                       )
-    elif args.lr_scheduler_type == 'ReduceLROnPlateau':
-        lr_scheduler = ReduceLROnPlateauPatch(optimizer, 'max', patience=1, factor=0.9)
-    elif args.lr_scheduler_type == 'CosineAnnealingLR':
-        lr_scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-7)
+    lr_scheduler = get_lr_scheduler(args, optimizer)
 
     # We need to initialize the trackers we use, and also store our configuration.
     if args.with_tracking:
@@ -478,17 +291,12 @@ def main():
                             'train/learning_rate': last_lr,
                             'eval/best_acc': best_valid_acc,
                             'eval/acc': valid_acc,
-                            'global_step': global_step,
                         })
                         train_loss.reset()
                         train_acc.reset()
 
             if (global_step // args.gradient_accumulation_steps) >= args.max_train_steps:
                 break
-
-    if args.output_dir is not None:
-        model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
 
     # load model at best checkpoint step
     model = model.from_pretrained(os.path.join(args.output_dir, f'step_{best_checkpoining_steps}'))
@@ -498,7 +306,7 @@ def main():
     with torch.no_grad():
         test_acc = evaluating(args, test_dataloader, model, TASK_LABELS_DESC[args.task_dataset])
 
-    logger.info(f'\nxnli testset: accuracy: {test_acc:.4f}')
+    logger.info(f'\n{args.task_dataset} test set: accuracy: {test_acc:.4f}')
 
     if args.output_dir is not None:
         with open(os.path.join(args.output_dir, 'all_results.json'), 'w') as f:
