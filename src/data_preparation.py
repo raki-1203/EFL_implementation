@@ -57,16 +57,16 @@ def make_csv_dataset(file_name, file_name2=None):
         df['label'] = df['label'].apply(lambda x: '긍정' if x == 1 else '부정')
 
     if file_name2 is not None:
-        save_path = 'xnli.train.ko.csv'
+        save_path = os.path.join(data_dir, 'xnli.train.ko.csv')
     else:
         save_path = file_path[:-len(extension)] + 'csv'
     df.to_csv(save_path, index=False)
 
 
 if __name__ == '__main__':
-    make_csv_dataset(file_name='Korean_Singular_Conversation_Dataset.xlsx')
+    # make_csv_dataset(file_name='Korean_Singular_Conversation_Dataset.xlsx')
     make_csv_dataset(file_name='snli_1.0_train.ko.tsv', file_name2='multinli.train.ko.tsv')
-    make_csv_dataset(file_name='xnli.dev.ko.tsv')
-    make_csv_dataset(file_name='xnli.test.ko.tsv')
-    make_csv_dataset(file_name='ratings_train.txt')
-    make_csv_dataset(file_name='ratings_test.txt')
+    # make_csv_dataset(file_name='xnli.dev.ko.tsv')
+    # make_csv_dataset(file_name='xnli.test.ko.tsv')
+    # make_csv_dataset(file_name='ratings_train.txt')
+    # make_csv_dataset(file_name='ratings_test.txt')
