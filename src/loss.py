@@ -36,11 +36,11 @@ class RDropLoss(nn.Module):
         Returns:
             Tensor: Returns tensor `loss`, the rdrop loss of p and q.
         """
-        p_loss = F.kl_div(F.log_softmax(p, axis=-1),
-                          F.softmax(q, axis=-1),
+        p_loss = F.kl_div(F.log_softmax(p, dim=-1),
+                          F.softmax(q, dim=-1),
                           reduction=self.reduction)
-        q_loss = F.kl_div(F.log_softmax(q, axis=-1),
-                          F.softmax(p, axis=-1),
+        q_loss = F.kl_div(F.log_softmax(q, dim=-1),
+                          F.softmax(p, dim=-1),
                           reduction=self.reduction)
 
         # You can choose whether to use function "sum" and "mean" depending on your task

@@ -1,16 +1,29 @@
+from functools import partial
+
 import os
 import pickle
-
+import random
+import numpy as np
 import pandas as pd
+
+import torch
+
 from datasets import Features, Value, DatasetDict, Dataset
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler, CosineAnnealingLR
+from torch.utils.data import DataLoader
 from transformers import AutoConfig, BertTokenizer, AutoTokenizer, RobertaForSequenceClassification, \
-    AutoModelForSequenceClassification, get_linear_schedule_with_warmup
-
+    AutoModelForSequenceClassification, get_linear_schedule_with_warmup, default_data_collator, DataCollatorWithPadding
 
 project_dir = os.path.dirname(os.path.dirname(__file__))
 data_dir = os.path.join(project_dir, 'data')
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def save_pickle(fname, obj):
@@ -45,16 +58,15 @@ class AverageMeter(object):
 def make_dataset(args):
     if args.train_file:
         train_path = os.path.join(data_dir, args.train_file)
+        train_df = pd.read_csv(train_path)
     if args.validation_file:
         valid_path = os.path.join(data_dir, args.validation_file)
+        valid_df = pd.read_csv(valid_path)
     if args.test_file:
         test_path = os.path.join(data_dir, args.test_file)
-
-    if args.task_dataset == 'kornli':
-        train_df = pd.read_csv(train_path)
-        valid_df = pd.read_csv(valid_path)
         test_df = pd.read_csv(test_path)
 
+    if args.task_dataset == 'kornli':
         f = Features({'sentence1': Value(dtype='string', id=None),
                       'sentence2': Value(dtype='string', id=None),
                       'label': Value(dtype='string', id=None)})
@@ -64,8 +76,21 @@ def make_dataset(args):
                                 'test': Dataset.from_pandas(test_df, features=f)})
 
         datasets.save_to_disk(os.path.join(data_dir, 'kornli_dataset'))
+    elif args.task_dataset == 'kornli-efl':
+        train_df['label'] = train_df['label'].apply(lambda x: 'not entail' if x != 'entailment' else 'entail')
+        valid_df['label'] = valid_df['label'].apply(lambda x: 'not entail' if x != 'entailment' else 'entail')
+        test_df['label'] = test_df['label'].apply(lambda x: 'not entail' if x != 'entailment' else 'entail')
+
+        f = Features({'sentence1': Value(dtype='string', id=None),
+                      'sentence2': Value(dtype='string', id=None),
+                      'label': Value(dtype='string', id=None)})
+
+        datasets = DatasetDict({'train': Dataset.from_pandas(train_df, features=f),
+                                'validation': Dataset.from_pandas(valid_df, features=f),
+                                'test': Dataset.from_pandas(test_df, features=f)})
+
+        datasets.save_to_disk(os.path.join(data_dir, 'kornli-efl_dataset'))
     elif args.task_dataset == 'ksc':
-        train_df = pd.read_csv(train_path)
         train_df.columns = ['sentence1', 'label']
 
         train_df, test_df = train_test_split(train_df, test_size=0.1, stratify=train_df['label'],
@@ -82,6 +107,14 @@ def make_dataset(args):
                                 'test': Dataset.from_pandas(test_df, features=f)})
 
         datasets.save_to_disk(os.path.join(data_dir, 'ksc_dataset'))
+    elif args.task_dataset == 'nsmc':
+        f = Features({'sentence1': Value(dtype='string', id=None),
+                      'label': Value(dtype='string', id=None)})
+
+        datasets = DatasetDict({'train': Dataset.from_pandas(train_df, features=f),
+                                'validation': Dataset.from_pandas(valid_df, features=f)})
+
+        datasets.save_to_disk(os.path.join(data_dir, 'nsmc_dataset'))
 
 
 class ReduceLROnPlateauPatch(ReduceLROnPlateau, _LRScheduler):
@@ -138,9 +171,93 @@ def get_lr_scheduler(args, optimizer):
                                                        num_training_steps=args.max_train_steps,
                                                        )
     elif args.lr_scheduler_type == 'ReduceLROnPlateau':
-        lr_scheduler = ReduceLROnPlateauPatch(optimizer, 'max', patience=1, factor=0.9)
+        lr_scheduler = ReduceLROnPlateauPatch(optimizer, 'max', patience=args.patience, factor=0.9)
     elif args.lr_scheduler_type == 'CosineAnnealingLR':
         lr_scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-7)
 
     return lr_scheduler
 
+
+def get_dataloader(args, datasets, tokenizer, padding, label_to_id=None):
+    # Preprocessing the datasets
+    non_label_column_names = [name for name in datasets['train'].column_names if name != 'label']
+    if 'sentence1' in non_label_column_names and 'sentence2' in non_label_column_names:
+        sentence1_key, sentence2_key = 'sentence1', 'sentence2'
+    else:
+        if len(non_label_column_names) >= 2:
+            sentence1_key, sentence2_key = non_label_column_names[:2]
+        else:
+            sentence1_key, sentence2_key = non_label_column_names[0], None
+
+    # DataLoaders creation:
+    if args.pad_to_max_length:
+        # If padding was already done or max length, we use the default data collator that will just convert everything
+        # to tensors.
+        data_collator = default_data_collator
+    else:
+        # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
+        # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
+        # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
+        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if args.use_fp16 else None))
+
+    preprocess_func = partial(preprocess_function,
+                              args=args,
+                              sentence_key=[sentence1_key, sentence2_key],
+                              tokenizer=tokenizer,
+                              padding=padding,
+                              label_to_id=label_to_id,
+                              )
+
+    dataloader_list = []
+    train_valid_test_list = ['train', 'validation', 'test']
+    if len(datasets.keys()) == 2:
+        train_valid_test_list = ['train', 'validation']
+    for k in train_valid_test_list:
+        k_dataset = datasets[k]
+
+        k_dataset = k_dataset.map(
+            preprocess_func,
+            batched=True,
+            remove_columns=datasets['train'].column_names,
+            desc='Running tokenizer on dataset',
+        )
+
+        if k == 'train':
+            k_dataloader = DataLoader(k_dataset,
+                                      collate_fn=data_collator,
+                                      batch_size=args.per_device_train_batch_size,
+                                      shuffle=True,
+                                      )
+        else:
+            k_dataloader = DataLoader(k_dataset,
+                                      collate_fn=data_collator,
+                                      batch_size=args.per_device_eval_batch_size,
+                                      )
+
+        dataloader_list.append(k_dataloader)
+
+    return dataloader_list
+
+
+def preprocess_function(examples, args, sentence_key, tokenizer, padding, label_to_id=None):
+    sentence1_key, sentence2_key = sentence_key
+
+    # Tokenize the texts
+    texts = (
+        (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
+    )
+    result = tokenizer(*texts,
+                       padding=padding,
+                       max_length=args.max_length,
+                       truncation=True,
+                       return_token_type_ids=False,
+                       )
+
+    if 'label' in examples:
+        # Map labels to IDs
+        if label_to_id is None:
+            result['labels'] = examples['label']
+        else:
+            result['labels'] = [label_to_id[l] for l in examples['label']]
+
+    return result

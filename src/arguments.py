@@ -23,7 +23,7 @@ def parse_args():
                         type=str,
                         default=None,
                         help='dataset name',
-                        choices=['kornli', 'ksc'],
+                        choices=['kornli', 'kornli-efl', 'ksc', 'nsmc'],
                         )
     parser.add_argument("--negative_num",
                         default=1,
@@ -110,6 +110,9 @@ def parse_args():
         help='using cpu or gpu',
     )
     parser.add_argument(
+        '--patience', type=int, default=1, help='Number of patience for ReduceLROnPlateau lr_scheduler'
+    )
+    parser.add_argument(
         '--num_warmup_steps', type=int, default=0, help='Number of steps for the warmup in the lr scheduler.'
     )
     parser.add_argument('--output_dir', type=str, default=None, help='Where to store the final model.')
@@ -132,7 +135,7 @@ def parse_args():
         '--resume_from_checkpoint',
         type=str,
         default=None,
-        help='If the training should continue from a checkpoint folder.',
+        help='If the training should continue from a checkpoint folder. start from project folder',
     )
     parser.add_argument(
         '--with_tracking',
@@ -167,6 +170,10 @@ def parse_args():
     if args.vocab_path:
         if os.path.isdir(os.path.join(project_dir, args.vocab_path)):
             args.vocab_path = os.path.join(project_dir, args.vocab_path)
+
+    # resume_from_checkpoint 사용시
+    if args.resume_from_checkpoint is not None:
+        args.resume_from_checkpoint = os.path.join(project_dir, args.resume_from_checkpoint)
 
     # Sanity checks
     if args.train_file is None and args.validation_file is None:

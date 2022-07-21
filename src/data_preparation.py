@@ -52,6 +52,7 @@ def make_csv_dataset(file_name, file_name2=None):
         df = df.rename(columns={'Sentence': 'sentence1', 'Emotion': 'label'})
     elif extension == 'txt':
         df = pd.read_csv(file_path, sep='\t')
+        df.dropna(inplace=True)
         df = df[['document', 'label']]
         df.columns = ['sentence1', 'label']
         df['label'] = df['label'].apply(lambda x: '긍정' if x == 1 else '부정')
@@ -64,9 +65,9 @@ def make_csv_dataset(file_name, file_name2=None):
 
 
 if __name__ == '__main__':
-    # make_csv_dataset(file_name='Korean_Singular_Conversation_Dataset.xlsx')
+    make_csv_dataset(file_name='Korean_Singular_Conversation_Dataset.xlsx')
     make_csv_dataset(file_name='snli_1.0_train.ko.tsv', file_name2='multinli.train.ko.tsv')
-    # make_csv_dataset(file_name='xnli.dev.ko.tsv')
-    # make_csv_dataset(file_name='xnli.test.ko.tsv')
-    # make_csv_dataset(file_name='ratings_train.txt')
-    # make_csv_dataset(file_name='ratings_test.txt')
+    make_csv_dataset(file_name='xnli.dev.ko.tsv')
+    make_csv_dataset(file_name='xnli.test.ko.tsv')
+    make_csv_dataset(file_name='ratings_train.txt')
+    make_csv_dataset(file_name='ratings_test.txt')

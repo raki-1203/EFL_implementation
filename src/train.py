@@ -2,23 +2,15 @@ import json
 import math
 import os
 import sys
-import random
 import logging
-
 import wandb
-import numpy as np
+
 import torch
+
 from datasets import load_from_disk
 from torch import nn
 from torch.cuda.amp import autocast
-from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-
-from accelerate.utils import set_seed
-from transformers import (
-    DataCollatorWithPadding,
-    default_data_collator,
-)
 
 
 project_dir = os.path.dirname(os.path.dirname(__file__))
@@ -32,6 +24,8 @@ from src.utils import (
     get_config_tokenizer_model,
     get_optimizer_grouped_parameters,
     get_lr_scheduler,
+    set_seed,
+    get_dataloader,
 )
 from src.arguments import parse_args
 
@@ -40,84 +34,9 @@ os.environ['WANDB_SILENT'] = "true"
 
 # gpu setting
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # Arrange GPU devices starting from 0
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Set the GPU 0 to use
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Set the GPU 0 to use
 
 logger = logging.getLogger(__name__)
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def get_dataloader(args, datasets, tokenizer, padding, label_to_id):
-    # Preprocessing the datasets
-    non_label_column_names = [name for name in datasets['train'].column_names if name != 'label']
-    if 'sentence1' in non_label_column_names and 'sentence2' in non_label_column_names:
-        sentence1_key, sentence2_key = 'sentence1', 'sentence2'
-    else:
-        if len(non_label_column_names) >= 2:
-            sentence1_key, sentence2_key = non_label_column_names[:2]
-        else:
-            sentence1_key, sentence2_key = non_label_column_names[0], None
-
-    def preprocess_function(examples):
-        # Tokenize the texts
-        texts = (
-            (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
-        )
-        result = tokenizer(*texts,
-                           padding=padding,
-                           max_length=args.max_length,
-                           truncation=True,
-                           return_token_type_ids=False,
-                           )
-
-        if 'label' in examples:
-            # Map labels to IDs
-            result['labels'] = [label_to_id[l] for l in examples['label']]
-
-        return result
-
-    # DataLoaders creation:
-    if args.pad_to_max_length:
-        # If padding was already done or max length, we use the default data collator that will just convert everything
-        # to tensors.
-        data_collator = default_data_collator
-    else:
-        # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
-        # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
-        # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if args.use_fp16 else None))
-
-    dataloader_list = []
-    for k in ['train', 'validation', 'test']:
-        k_dataset = datasets[k]
-
-        k_dataset = k_dataset.map(
-            preprocess_function,
-            batched=True,
-            remove_columns=datasets['train'].column_names,
-            desc='Running tokenizer on dataset',
-        )
-
-        if k == 'train':
-            k_dataloader = DataLoader(k_dataset,
-                                      collate_fn=data_collator,
-                                      batch_size=args.per_device_train_batch_size,
-                                      shuffle=True,
-                                      )
-        else:
-            k_dataloader = DataLoader(k_dataset,
-                                      collate_fn=data_collator,
-                                      batch_size=args.per_device_eval_batch_size,
-                                      )
-
-        dataloader_list.append(k_dataloader)
-
-    return dataloader_list
 
 
 def main():
@@ -147,12 +66,16 @@ def main():
     # Trying to have good defaults here, don't hesitate to tweak to your needs.
     is_regresssion = raw_datasets['train'].features['label'].dtype in ['float32', 'float64']
     if is_regresssion:
-        num_labels = 1
+        label_list = None
+    elif args.task_dataset == 'kornli-efl':
+        label_list = ['not entail', 'entail']
+    elif args.task_dataset == 'nsmc':
+        label_list = ['부정', '긍정']
     else:
         # A useful fast method
         label_list = raw_datasets['train'].unique('label')
         label_list.sort()  # Let's sort it for determinism
-        num_labels = len(label_list)
+    num_labels = len(label_list) if label_list is not None else 1
 
     # Load pretrained model and tokenizer
     config, tokenizer, model = get_config_tokenizer_model(args, num_labels)
@@ -166,7 +89,12 @@ def main():
 
     padding = 'max_length' if args.pad_to_max_length else False
 
-    train_dataloader, eval_dataloader, test_dataloader = get_dataloader(args, raw_datasets, tokenizer, padding, label_to_idx)
+    if len(raw_datasets.keys()) == 2:
+        train_dataloader, eval_dataloader = get_dataloader(args, raw_datasets, tokenizer, padding, label_to_idx)
+        test_dataloader = None
+    else:
+        train_dataloader, eval_dataloader, test_dataloader = get_dataloader(args, raw_datasets, tokenizer, padding,
+                                                                            label_to_idx)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -219,19 +147,48 @@ def main():
     logger.info(f'  Total optimization steps = {args.max_train_steps}')
 
     global_step = 0
+    starting_epoch = 0
     train_loss = AverageMeter()
     train_acc = AverageMeter()
+
+    # Potentially load in the weights and states from a previous save
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
+            logger.info(f"Resumed from checkpoint: {args.resume_from_checkpoint}")
+            model.load_state(args.resume_from_checkpoint)
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = [f.name for f in os.scandir(args.output_dir) if f.is_dir()]
+            dirs.sort(key=os.path.getctime)
+            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
+        # Extract `epoch_{i}` or `step_{i}`
+        training_difference = os.path.splitext(path)[0]
+
+        if "epoch" in training_difference:
+            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
+            resume_step = None
+        else:
+            resume_step = int(training_difference.replace("step_", ""))
+            starting_epoch = resume_step // len(train_dataloader)
+            resume_step -= starting_epoch * len(train_dataloader)
 
     if isinstance(checkpointing_steps, int):
         best_checkpoining_steps = None
         best_valid_acc = 0
 
-    for epoch in range(args.num_train_epochs):
+    for epoch in range(starting_epoch, args.num_train_epochs):
         print(f'\n{epoch + 1} epoch start!')
         torch.cuda.empty_cache()
 
         train_iterator = tqdm(train_dataloader, desc='train-Iteration')
         for step, batch in enumerate(train_iterator):
+            # We need to skip steps until we reach the resumed step
+            if args.resume_from_checkpoint and epoch == starting_epoch:
+                if resume_step is not None and step < resume_step:
+                    global_step += 1
+                    continue
+
             loss, acc = training_per_step(args, batch, model, optimizer, criterion, lr_scheduler, global_step)
             train_loss.update(loss, args.per_device_train_batch_size)
             train_acc.update(acc / args.per_device_train_batch_size)
@@ -249,20 +206,19 @@ def main():
 
             if isinstance(checkpointing_steps, int):
                 if global_step != 0 and (global_step / args.gradient_accumulation_steps) % checkpointing_steps == 0:
-                    with torch.no_grad():
-                        valid_loss, valid_acc = evaluating(args, eval_dataloader, model, criterion)
+                    valid_loss, valid_acc = evaluating(args, eval_dataloader, model, criterion)
 
-                        if args.lr_scheduler_type == 'ReduceLROnPlateau':
-                            lr_scheduler.step(valid_acc)
+                    if args.lr_scheduler_type == 'ReduceLROnPlateau':
+                        lr_scheduler.step(valid_acc)
 
-                        if valid_acc > best_valid_acc:
-                            best_valid_acc = valid_acc
-                            best_checkpoining_steps = global_step
-                            output_dir = f'step_{best_checkpoining_steps}'
-                            if args.output_dir is not None:
-                                output_dir = os.path.join(args.output_dir, output_dir)
-                            model.save_pretrained(output_dir)
-                            tokenizer.save_pretrained(output_dir)
+                    if valid_acc > best_valid_acc:
+                        best_valid_acc = valid_acc
+                        best_checkpoining_steps = global_step
+                        output_dir = f'step_{best_checkpoining_steps}'
+                        if args.output_dir is not None:
+                            output_dir = os.path.join(args.output_dir, output_dir)
+                        model.save_pretrained(output_dir)
+                        tokenizer.save_pretrained(output_dir)
 
                     if args.with_tracking:
                         wandb.log({
@@ -279,19 +235,24 @@ def main():
             if (global_step // args.gradient_accumulation_steps) >= args.max_train_steps:
                 break
 
-    # load model at best checkpoint step
-    model = model.from_pretrained(os.path.join(args.output_dir, f'step_{best_checkpoining_steps}'))
-    model.to(args.device)
+    if test_dataloader is not None:
+        # load model at best checkpoint step
+        model = model.from_pretrained(os.path.join(args.output_dir, f'step_{best_checkpoining_steps}'))
+        model.to(args.device)
 
-    # Final evaluation on test set
-    with torch.no_grad():
-        test_loss, test_acc = evaluating(args, test_dataloader, model, criterion)
+        # Final evaluation on kornli test set
+        with torch.no_grad():
+            test_loss, test_acc = evaluating(args, test_dataloader, model, criterion)
 
-    logger.info(f'\n{args.task_dataset} test set: accuracy: {test_acc:.4f}')
+        logger.info(f'\n{args.task_dataset} test set: accuracy: {test_acc:.4f}')
 
-    if args.output_dir is not None:
-        with open(os.path.join(args.output_dir, 'all_results.json'), 'w') as f:
-            json.dump({'best_step': best_checkpoining_steps, 'test_accuracy': test_acc}, f)
+        if args.output_dir is not None:
+            with open(os.path.join(args.output_dir, 'all_results.json'), 'w') as f:
+                json.dump({'best_step': best_checkpoining_steps, 'test_accuracy': test_acc}, f)
+    else:
+        if args.output_dir is not None:
+            with open(os.path.join(args.output_dir, 'all_results.json'), 'w') as f:
+                json.dump({'best_step': best_checkpoining_steps, 'test_accuracy': best_valid_acc}, f)
 
     if args.with_tracking:
         wandb.finish()
@@ -327,23 +288,24 @@ def evaluating(args, eval_dataloader, model, criterion):
     eval_loss = AverageMeter()
     eval_acc = AverageMeter()
 
-    eval_iterator = tqdm(eval_dataloader, desc='eval-Iteration')
-    for step, batch in enumerate(eval_iterator):
-        batch = {k: v.to(args.device) for k, v in batch.items()}
+    with torch.no_grad():
+        eval_iterator = tqdm(eval_dataloader, desc='eval-Iteration')
+        for step, batch in enumerate(eval_iterator):
+            batch = {k: v.to(args.device) for k, v in batch.items()}
 
-        outputs = model(**batch)
+            outputs = model(**batch)
 
-        logits = outputs.logits
-        preds = torch.argmax(logits, dim=-1)
+            logits = outputs.logits
+            preds = torch.argmax(logits, dim=-1)
 
-        loss = criterion(logits, batch['labels'])
-        acc = torch.sum(preds.cpu() == batch['labels'].cpu())
+            loss = criterion(logits, batch['labels'])
+            acc = torch.sum(preds.cpu() == batch['labels'].cpu())
 
-        eval_loss.update(loss.item(), args.per_device_eval_batch_size)
-        eval_acc.update(acc.item() / args.per_device_eval_batch_size)
+            eval_loss.update(loss.item(), args.per_device_eval_batch_size)
+            eval_acc.update(acc.item() / args.per_device_eval_batch_size)
 
-        description = f'eval loss: {eval_loss.avg:.4f} | eval acc: {eval_acc.avg:.4f}'
-        eval_iterator.set_description(description)
+            description = f'eval loss: {eval_loss.avg:.4f} | eval acc: {eval_acc.avg:.4f}'
+            eval_iterator.set_description(description)
 
     eval_loss = eval_loss.avg
     eval_acc = eval_acc.avg
