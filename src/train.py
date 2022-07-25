@@ -1,5 +1,6 @@
 import json
 import math
+import shutil
 import os
 import sys
 import logging
@@ -7,6 +8,7 @@ import wandb
 
 import torch
 
+from glob import glob
 from datasets import load_from_disk
 from torch import nn
 from torch.cuda.amp import autocast
@@ -212,6 +214,10 @@ def main():
                         lr_scheduler.step(valid_acc)
 
                     if valid_acc > best_valid_acc:
+                        # 이전 best model 폴더 제거 -> 용량 문제로 학습 터짐
+                        best_model_folder = glob(os.path.join(args.output_dir, 'step_*'))
+                        if len(best_model_folder) == 1:
+                            shutil.rmtree(best_model_folder[0])
                         best_valid_acc = valid_acc
                         best_checkpoining_steps = global_step
                         output_dir = f'step_{best_checkpoining_steps}'

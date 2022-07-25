@@ -170,6 +170,8 @@ def parse_args():
     if args.vocab_path:
         if os.path.isdir(os.path.join(project_dir, args.vocab_path)):
             args.vocab_path = os.path.join(project_dir, args.vocab_path)
+    else:
+        args.vocab_path = args.model_name_or_path
 
     # resume_from_checkpoint 사용시
     if args.resume_from_checkpoint is not None:
