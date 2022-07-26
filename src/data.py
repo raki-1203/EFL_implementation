@@ -112,15 +112,25 @@ class NSMCProcessor(object):
             train_examples.extend(neg_examples)
         for example in valid_datasets:
             true_label = str(example['label'])
-            for label, label_description in task_label_description.items():
-                new_example = dict()
-                new_example['sentence1'] = example['sentence1']
-                new_example['sentence2'] = label_description
 
-                # Get true_label's index at task_label_description for evaluate
-                true_label_index = list(task_label_description.keys()).index(true_label)
-                new_example['label'] = true_label_index
-                valid_examples.append(new_example)
+            new_example = dict()
+            new_example['sentence1'] = example['sentence1']
+            new_example['sentence2'] = task_label_description['긍정']
+
+            # Get true_label's index at task_label_description for evaluate
+            true_label_index = list(task_label_description.keys()).index(true_label)
+            new_example['label'] = true_label_index
+            valid_examples.append(new_example)
+
+            # for label, label_description in task_label_description.items():
+            #     new_example = dict()
+            #     new_example['sentence1'] = example['sentence1']
+            #     new_example['sentence2'] = label_description
+            #
+            #     # Get true_label's index at task_label_description for evaluate
+            #     true_label_index = list(task_label_description.keys()).index(true_label)
+            #     new_example['label'] = true_label_index
+            #     valid_examples.append(new_example)
 
         train_examples = pd.DataFrame(train_examples)
         valid_examples = pd.DataFrame(valid_examples)

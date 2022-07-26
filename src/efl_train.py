@@ -214,7 +214,7 @@ def main():
 
             if isinstance(checkpointing_steps, int):
                 if global_step != 0 and (global_step / args.gradient_accumulation_steps) % checkpointing_steps == 0:
-                    valid_acc = evaluating(args, eval_dataloader, model, TASK_LABELS_DESC[args.task_dataset])
+                    valid_loss, valid_acc = evaluating(args, eval_dataloader, model, criterion, TASK_LABELS_DESC[args.task_dataset])
 
                     if args.lr_scheduler_type == 'ReduceLROnPlateau':
                         lr_scheduler.step(valid_acc)
@@ -238,6 +238,7 @@ def main():
                             'train/acc': train_acc.avg,
                             'train/learning_rate': last_lr,
                             'eval/best_acc': best_valid_acc,
+                            'eval/loss': valid_loss,
                             'eval/acc': valid_acc,
                         })
                         train_loss.reset()
@@ -253,7 +254,7 @@ def main():
 
         # Final evaluation on kornli test set
         with torch.no_grad():
-            test_acc = evaluating(args, test_dataloader, model, TASK_LABELS_DESC[args.task_dataset])
+            test_loss, test_acc = evaluating(args, test_dataloader, model, criterion, TASK_LABELS_DESC[args.task_dataset])
 
         logger.info(f'\n{args.task_dataset} test set: accuracy: {test_acc:.4f}')
 
@@ -299,46 +300,60 @@ def training_per_step(args, batch, model, optimizer, criterion, rdrop_loss, lr_s
     return loss.item(), acc.item()
 
 
-def evaluating(args, eval_dataloader, model, task_label_description):
+def evaluating(args, eval_dataloader, model, criterion, task_label_description):
     model.eval()
 
     # eval phase
-    class_num = len(task_label_description)
+    eval_loss = AverageMeter()
+    eval_acc = AverageMeter()
+    # class_num = len(task_label_description)
 
     # [total_num * class_num, 2]
-    all_prediction_probs = []
+    # all_prediction_probs = []
     # [total_num * class_num]
-    all_labels = []
+    # all_labels = []
 
     with torch.no_grad():
         eval_iterator = tqdm(eval_dataloader, desc='eval-Iteration')
         for step, batch in enumerate(eval_iterator):
             batch = {k: v.to(args.device) for k, v in batch.items()}
-            input_ids, attention_mask = batch['input_ids'], batch['attention_mask']
 
-            outputs = model(input_ids=input_ids,
-                            attention_mask=attention_mask)
+            outputs = model(**batch)
 
             logits = outputs.logits
+            preds = torch.argmax(logits, dim=-1)
 
-            all_prediction_probs.append(logits.detach().cpu().numpy())
-            all_labels.append(batch['labels'].detach().cpu().numpy())
+            loss = outputs.loss
+            acc = torch.sum(preds.cpu() == batch['labels'].cpu())
 
-    all_labels = np.concatenate(all_labels, axis=0)
-    all_prediction_probs = np.concatenate(all_prediction_probs, axis=0)
-    all_prediction_probs = np.reshape(all_prediction_probs, (-1, class_num, 2))
+            eval_loss.update(loss.item(), args.per_device_eval_batch_size)
+            eval_acc.update(acc.item() / args.per_device_eval_batch_size)
 
-    prediction_pos_probs = all_prediction_probs[:, :, 1]
-    prediction_pos_probs = np.reshape(prediction_pos_probs, (-1, class_num))
-    y_pred_index = np.argmax(prediction_pos_probs, axis=-1)
+            description = f'eval loss: {eval_loss.avg:.4f} | eval acc: {eval_acc.avg:.4f}'
+            eval_iterator.set_description(description)
 
-    y_true_index = np.array([true_label_index for idx, true_label_index in enumerate(all_labels)
-                             if idx % class_num == 0])
+            # all_prediction_probs.append(logits.detach().cpu().numpy())
+            # all_labels.append(batch['labels'].detach().cpu().numpy())
+    #
+    # all_labels = np.concatenate(all_labels, axis=0)
+    # all_prediction_probs = np.concatenate(all_prediction_probs, axis=0)
+    # all_prediction_probs = np.reshape(all_prediction_probs, (-1, class_num, 2))
+    #
+    # prediction_pos_probs = all_prediction_probs[:, :, 1]
+    # prediction_pos_probs = np.reshape(prediction_pos_probs, (-1, class_num))
+    # y_pred_index = np.argmax(prediction_pos_probs, axis=-1)
+    #
+    # y_true_index = np.array([true_label_index for idx, true_label_index in enumerate(all_labels)
+    #                          if idx % class_num == 0])
+    #
+    # total_num = len(y_true_index)
+    # correct_num = (y_pred_index == y_true_index).sum()
 
-    total_num = len(y_true_index)
-    correct_num = (y_pred_index == y_true_index).sum()
+    eval_loss = eval_loss.avg
+    eval_acc = eval_acc.avg
 
-    return correct_num / total_num
+    # return correct_num / total_num
+    return eval_loss, eval_acc
 
 
 if __name__ == '__main__':

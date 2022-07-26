@@ -20,8 +20,8 @@ korean_singular_conversation_label_descriptions = {
 
 # Description 1
 nsmc_label_descriptions = {
-    '긍정': '이것은 훌륭한 영화입니다.',
     '부정': '이것은 최악의 영화입니다.',
+    '긍정': '이것은 훌륭한 영화입니다.',
 }
 
 TASK_LABELS_DESC = {
