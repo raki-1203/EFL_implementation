@@ -161,7 +161,7 @@ def main():
             path = os.path.basename(args.resume_from_checkpoint)
         else:
             # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(args.output_dir) if f.is_dir()]
+            dirs = [os.path.join(args.output_dir, f.name) for f in os.scandir(args.output_dir) if f.is_dir()]
             dirs.sort(key=os.path.getctime)
             path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
         # Extract `epoch_{i}` or `step_{i}`
@@ -266,23 +266,23 @@ def main():
 
 def training_per_step(args, batch, model, optimizer, criterion, lr_scheduler, global_step):
     model.train()
-    with autocast():
-        batch = {k: v.to(args.device) for k, v in batch.items()}
 
-        outputs = model(**batch)
+    batch = {k: v.to(args.device) for k, v in batch.items()}
 
-        logits = outputs.logits
-        preds = torch.argmax(logits, dim=-1)
+    outputs = model(**batch)
 
-        loss = criterion(logits, batch['labels'])
-        acc = torch.sum(preds.cpu() == batch['labels'].cpu())
+    logits = outputs.logits
+    preds = torch.argmax(logits, dim=-1)
 
-        loss.backward()
-        if (global_step + 1) % args.gradient_accumulation_steps == 0:
-            optimizer.step()
-            optimizer.zero_grad()
-            if args.lr_scheduler_type != 'ReduceLROnPlateau':
-                lr_scheduler.step()
+    loss = criterion(logits, batch['labels'])
+    acc = torch.sum(preds.cpu() == batch['labels'].cpu())
+
+    loss.backward()
+    if (global_step + 1) % args.gradient_accumulation_steps == 0:
+        optimizer.step()
+        optimizer.zero_grad()
+        if args.lr_scheduler_type != 'ReduceLROnPlateau':
+            lr_scheduler.step()
 
     return loss.item(), acc.item()
 
