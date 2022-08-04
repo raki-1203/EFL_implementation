@@ -191,7 +191,7 @@ def main():
                     global_step += 1
                     continue
 
-            loss, acc = training_per_step(args, batch, model, optimizer, criterion, lr_scheduler, global_step)
+            loss, acc = training_per_step(args, batch, model, optimizer, criterion, global_step)
             train_loss.update(loss, args.per_device_train_batch_size)
             train_acc.update(acc / args.per_device_train_batch_size)
             global_step += 1
@@ -266,7 +266,7 @@ def main():
         wandb.finish()
 
 
-def training_per_step(args, batch, model, optimizer, criterion, lr_scheduler, global_step):
+def training_per_step(args, batch, model, optimizer, criterion, global_step):
     model.train()
 
     batch = {k: v.to(args.device) for k, v in batch.items()}
