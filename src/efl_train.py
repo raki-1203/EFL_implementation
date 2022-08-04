@@ -218,6 +218,8 @@ def main():
 
                     if args.lr_scheduler_type == 'ReduceLROnPlateau':
                         lr_scheduler.step(valid_acc)
+                    else:
+                        lr_scheduler.step()
 
                     if valid_acc > best_valid_acc:
                         # 이전 best model 폴더 제거 -> 용량 문제로 학습 터짐
@@ -294,8 +296,6 @@ def training_per_step(args, batch, model, optimizer, criterion, rdrop_loss, lr_s
     if (global_step + 1) % args.gradient_accumulation_steps == 0:
         optimizer.step()
         optimizer.zero_grad()
-        if args.lr_scheduler_type != 'ReduceLROnPlateau':
-            lr_scheduler.step()
 
     return loss.item(), acc.item()
 
