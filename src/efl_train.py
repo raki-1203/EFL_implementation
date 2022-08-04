@@ -276,15 +276,21 @@ def training_per_step(args, batch, model, optimizer, criterion, rdrop_loss, glob
 
     batch = {k: v.to(args.device) for k, v in batch.items()}
 
+    # 첫번째 forward
     outputs = model(**batch)
 
     logits = outputs.logits
     preds = torch.argmax(logits, dim=-1)
 
+    # alpha 값인 rdrop_coef 가 주어지면
     if args.rdrop_coef > 0:
+        # 두번째 forward
         logits_2 = model(**batch).logits
+        # NLL Loss 계산
         ce_loss = (criterion(logits, batch['labels']) + criterion(logits_2, batch['labels'])) * 0.5
+        # KL Loss 계산
         kl_loss = rdrop_loss(logits, logits_2)
+        # final Loss 계산
         loss = ce_loss + kl_loss * args.rdrop_coef
     else:
         loss = criterion(logits, batch['labels'])
