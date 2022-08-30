@@ -1,5 +1,3 @@
-#### TMAX AI1-3, 손희락 (heerak_son@tmax.co.kr)
-
 # EFL_implementation
 
 ---
