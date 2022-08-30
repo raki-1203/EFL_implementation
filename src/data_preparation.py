@@ -51,11 +51,18 @@ def make_csv_dataset(file_name, file_name2=None):
         df = df[['Sentence', 'Emotion']]
         df = df.rename(columns={'Sentence': 'sentence1', 'Emotion': 'label'})
     elif extension == 'txt':
-        df = pd.read_csv(file_path, sep='\t')
-        df.dropna(inplace=True)
-        df = df[['document', 'label']]
-        df.columns = ['sentence1', 'label']
-        df['label'] = df['label'].apply(lambda x: '긍정' if x == 1 else '부정')
+        if 'ratings' in file_name:
+            df = pd.read_csv(file_path, sep='\t')
+            df.dropna(inplace=True)
+            df = df[['document', 'label']]
+            df.columns = ['sentence1', 'label']
+            df['label'] = df['label'].apply(lambda x: '긍정' if x == 1 else '부정')
+        elif file_name == 'naver_shopping.txt':
+            df = pd.read_csv(file_path, sep='\t')
+            df.columns = ['star_point', 'sentence1']
+            df['label'] = df['star_point'].apply(lambda x: '긍정' if x > 3 else '부정')
+            df.dropna(inplace=True)
+            df = df[['sentence1', 'label']]
 
     if file_name2 is not None:
         save_path = os.path.join(data_dir, 'xnli.train.ko.csv')
@@ -71,3 +78,4 @@ if __name__ == '__main__':
     make_csv_dataset(file_name='xnli.test.ko.tsv')
     make_csv_dataset(file_name='ratings_train.txt')
     make_csv_dataset(file_name='ratings_test.txt')
+    make_csv_dataset(file_name='naver_shopping.txt')

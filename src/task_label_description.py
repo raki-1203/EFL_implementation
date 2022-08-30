@@ -24,7 +24,14 @@ nsmc_label_descriptions = {
     '긍정': '이것은 훌륭한 영화입니다.',
 }
 
+# Description 1
+naver_shopping_descriptions = {
+    '부정': '부정적인 문장입니다',
+    '긍정': '긍정적인 문장입니다',
+}
+
 TASK_LABELS_DESC = {
     "ksc": korean_singular_conversation_label_descriptions,
     "nsmc": nsmc_label_descriptions,
+    'naver_shopping': naver_shopping_descriptions,
 }
