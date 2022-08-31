@@ -9,6 +9,7 @@ import pandas as pd
 import torch
 
 from datasets import Features, Value, DatasetDict, Dataset
+from konlpy.tag import Mecab
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler, CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -115,6 +116,19 @@ def make_dataset(args):
                                 'validation': Dataset.from_pandas(valid_df, features=f)})
 
         datasets.save_to_disk(os.path.join(data_dir, 'nsmc_dataset'))
+    elif args.task_dataset == 'naver_shopping':
+        train_df, valid_df = train_test_split(train_df, test_size=0.3, stratify=train_df['label'],
+                                              shuffle=True, random_state=args.seed)
+        train_df = train_df.reset_index(drop=True)
+        valid_df = valid_df.reset_index(drop=True)
+
+        f = Features({'sentence1': Value(dtype='string', id=None),
+                      'label': Value(dtype='string', id=None)})
+
+        datasets = DatasetDict({'train': Dataset.from_pandas(train_df, features=f),
+                                'validation': Dataset.from_pandas(valid_df, features=f)})
+
+        datasets.save_to_disk(os.path.join(data_dir, 'naver_shopping_dataset'))
 
 
 class ReduceLROnPlateauPatch(ReduceLROnPlateau, _LRScheduler):
@@ -241,6 +255,11 @@ def get_dataloader(args, datasets, tokenizer, padding, label_to_id=None):
 
 def preprocess_function(examples, args, sentence_key, tokenizer, padding, label_to_id=None):
     sentence1_key, sentence2_key = sentence_key
+
+    if args.vocab_path is not None:
+        # TBERT 사용시 Mecab + Wordpiece Tokenizer 이기 때문에 Mecab 미리 적용 필요
+        mecab = Mecab()
+        examples[sentence1_key] = [' '.join(mecab.morphs(sentence)) for sentence in examples[sentence1_key]]
 
     # Tokenize the texts
     texts = (
