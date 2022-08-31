@@ -5,14 +5,12 @@ import json
 import math
 import shutil
 import wandb
-import numpy as np
 
 import torch
 
 from glob import glob
 from datasets import load_from_disk
 from torch import nn
-from torch.cuda.amp import autocast
 from tqdm.auto import tqdm
 
 
