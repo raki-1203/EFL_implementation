@@ -23,7 +23,7 @@ def parse_args():
                         type=str,
                         default=None,
                         help='dataset name',
-                        choices=['kornli', 'kornli-efl', 'ksc', 'nsmc'],
+                        choices=['kornli', 'kornli-efl', 'ksc', 'nsmc', 'naver_shopping'],
                         )
     parser.add_argument("--negative_num",
                         default=1,
