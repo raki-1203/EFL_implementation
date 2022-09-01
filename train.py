@@ -11,7 +11,6 @@ import torch
 from glob import glob
 from datasets import load_from_disk
 from torch import nn
-from torch.cuda.amp import autocast
 from tqdm.auto import tqdm
 
 
@@ -20,16 +19,16 @@ data_dir = os.path.join(project_dir, 'data')
 
 sys.path.append(project_dir)
 
-from src.utils import (
+from utils.util import (
     AverageMeter,
-    make_dataset,
     get_config_tokenizer_model,
     get_optimizer_grouped_parameters,
     get_lr_scheduler,
     set_seed,
     get_dataloader,
 )
-from src.arguments import parse_args
+from utils.csv_to_dataset import make_dataset
+from arguments import parse_args
 
 # wandb description silent
 os.environ['WANDB_SILENT'] = "true"
