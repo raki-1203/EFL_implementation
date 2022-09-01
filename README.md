@@ -12,7 +12,7 @@ classification 을 위한 기본 fine-tuning 방식과 EFL 방법을 비교했�
 
 ## Dependency
 
-- `python 3.6.9`
+- `python 3.9`
 - `pip install -r requirements.txt`
 
 
@@ -20,21 +20,22 @@ classification 을 위한 기본 fine-tuning 방식과 EFL 방법을 비교했�
 
 참고 코드
 
-- `src/data.py`
-- `src/task_label_description.py`
+- `data_preparation.py`
+- `utils/data_preprocessor.py`
+- `utils/task_label_description.py`
 
 ## R-Drop Loss
 
 참고 코드
 
-- `src/loss.py`
+- `utils/loss.py`
 
 ## How to use
 
 기본 fine-tuning 방식 학습
 
 ```
-python src/train.py 
+python train.py 
 --train_file ratings_train.csv 
 --validation_file ratings_test.csv 
 --task_dataset nsmc 
@@ -58,7 +59,7 @@ python src/train.py
 EFL 방식 학습
 
 ```
-python src/efl_train.py 
+python efl_train.py 
 --train_file ratings_train.csv 
 --validation_file ratings_test.csv 
 --task_dataset nsmc 
@@ -82,7 +83,7 @@ python src/efl_train.py
 EFL + R-Drop 방식 학습
 
 ```
-python src/efl_train.py 
+python efl_train.py 
 --train_file ratings_train.csv 
 --validation_file ratings_test.csv 
 --task_dataset nsmc 
